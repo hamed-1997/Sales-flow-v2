@@ -1,0 +1,2578 @@
+"use strict";
+/* =========================================================
+   SalesFlow — app.js
+   Single-file application logic: IndexedDB layer, business
+   rules, and UI rendering. No build step, no framework.
+   ========================================================= */
+
+/* ---------------------------------------------------------
+   0. Small utilities
+   --------------------------------------------------------- */
+const $ = (sel, root) => (root || document).querySelector(sel);
+const $all = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+const escapeHtml = (str) =>
+  String(str == null ? "" : str).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+
+function toPersianSafeNumber(val) {
+  if (val === null || val === undefined) return NaN;
+  if (typeof val === "number") return val;
+  let s = String(val).trim();
+  if (s === "") return NaN;
+  const persianDigits = "۰۱۲۳۴۵۶۷۸۹";
+  s = s.replace(/[۰-۹]/g, (d) => String(persianDigits.indexOf(d)));
+  s = s.replace(/,/g, "").trim();
+  const n = parseFloat(s);
+  return isNaN(n) ? NaN : n;
+}
+
+function formatNumber(n) {
+  if (n === null || n === undefined || isNaN(n)) return "0";
+  return Math.round(n).toLocaleString("en-US");
+}
+
+function normalizeStr(v) {
+  return v === null || v === undefined ? "" : String(v).trim();
+}
+
+function isValidColumnLetter(v) {
+  return /^[A-Za-z]{1,3}$/.test(String(v || "").trim());
+}
+
+/** Renders a reference to the shared SVG icon sprite defined in index.html. */
+function icon(name, cls = "") {
+  return `<span class="icon ${cls}"><svg><use href="#icon-${name}"></use></svg></span>`;
+}
+
+/* ---------------------------------------------------------
+   0b. Jalali (Shamsi) date — self-contained, no CDN dependency
+   --------------------------------------------------------- */
+/** Gregorian date -> [jYear, jMonth(1-12), jDay]. Standard public-domain algorithm. */
+function gregorianToJalali(gy, gm, gd) {
+  const g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  let gy2 = gm > 2 ? gy + 1 : gy;
+  let days = 355666 + 365 * gy + Math.floor((gy2 + 3) / 4) - Math.floor((gy2 + 99) / 100) +
+    Math.floor((gy2 + 399) / 400) + gd + g_d_m[gm - 1];
+  let jy = -1595 + 33 * Math.floor(days / 12053);
+  days %= 12053;
+  jy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) { jy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
+  let jm, jd;
+  if (days < 186) { jm = 1 + Math.floor(days / 31); jd = 1 + (days % 31); }
+  else { jm = 7 + Math.floor((days - 186) / 30); jd = 1 + ((days - 186) % 30); }
+  return [jy, jm, jd];
+}
+function todayJalali() {
+  const now = new Date();
+  return gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
+}
+function pad2(n) { return String(n).padStart(2, "0"); }
+function jalaliToStr(y, m, d) { return `${y}/${pad2(m)}/${pad2(d)}`; }
+const PERSIAN_DIGIT_MAP = "۰۱۲۳۴۵۶۷۸۹";
+function toPersianDigits(v) {
+  return String(v).replace(/[0-9]/g, (d) => PERSIAN_DIGIT_MAP[Number(d)]);
+}
+function jalaliMonthName(m) {
+  return ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"][m - 1] || "";
+}
+
+/* ---------------------------------------------------------
+   1. Toasts
+   --------------------------------------------------------- */
+function showToast(message, type = "neutral", timeout = 3600) {
+  const region = $("#toast-region");
+  const el = document.createElement("div");
+  el.className = `toast ${type === "neutral" ? "" : type}`;
+  const iconName = type === "success" ? "check-circle" : type === "error" ? "x-circle" : type === "warning" ? "alert-triangle" : "info";
+  el.innerHTML = `${icon(iconName)}<span>${escapeHtml(message)}</span>`;
+  region.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = "opacity 200ms ease";
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 220);
+  }, timeout);
+}
+
+/* ---------------------------------------------------------
+   2. Modal (confirm / info / custom)
+   --------------------------------------------------------- */
+function openModal({ icon: iconName = "info", title, body, listItems = null, actions }) {
+  const region = $("#modal-region");
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const toneMap = { "alert-triangle": "tone-warning", trash: "tone-danger", "check-circle": "tone-success" };
+  const tone = toneMap[iconName] || "";
+  const listHtml = listItems && listItems.length
+    ? `<div class="modal-list">${listItems.map((i) => `<span class="badge badge-neutral">${escapeHtml(i)}</span>`).join("")}</div>`
+    : "";
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-icon ${tone}"><svg><use href="#icon-${iconName}"></use></svg></div>
+      <div class="modal-title">${escapeHtml(title)}</div>
+      <div class="modal-body">${body}</div>
+      ${listHtml}
+      <div class="modal-actions" id="modal-actions-slot"></div>
+    </div>`;
+  region.appendChild(overlay);
+  const actionsSlot = $("#modal-actions-slot", overlay);
+  actions.forEach((a) => {
+    const btn = document.createElement("button");
+    btn.className = `btn ${a.className || "btn-secondary"}`;
+    btn.textContent = a.label;
+    btn.onclick = () => {
+      overlay.remove();
+      if (a.onClick) a.onClick();
+    };
+    actionsSlot.appendChild(btn);
+  });
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay && actions.some((a) => a.dismissOnBackdrop !== false)) {
+      // only close on backdrop if there's a cancel-like action
+    }
+  });
+  return overlay;
+}
+
+function confirmModal({ icon, title, body, confirmLabel, confirmClass = "btn-danger", listItems = null }) {
+  return new Promise((resolve) => {
+    openModal({
+      icon, title, body, listItems,
+      actions: [
+        { label: "انصراف", className: "btn-secondary", onClick: () => resolve(false) },
+        { label: confirmLabel, className: confirmClass, onClick: () => resolve(true) },
+      ],
+    });
+  });
+}
+
+/* ---------------------------------------------------------
+   3. IndexedDB layer
+   --------------------------------------------------------- */
+const DB_NAME = "salesflow-db";
+const DB_VERSION = 2;
+let dbInstance = null;
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    if (dbInstance) return resolve(dbInstance);
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (ev) => {
+      const db = ev.target.result;
+      if (!db.objectStoreNames.contains("groups")) {
+        db.createObjectStore("groups", { keyPath: "id", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains("products")) {
+        db.createObjectStore("products", { keyPath: "code" });
+      }
+      if (!db.objectStoreNames.contains("settings")) {
+        db.createObjectStore("settings", { keyPath: "key" });
+      }
+      // v2 — SalesFlow نسخه ۲: مخزن فروش روزانه (برای تجمعی خودکار ماهانه)
+      if (!db.objectStoreNames.contains("salesLog")) {
+        db.createObjectStore("salesLog", { keyPath: "id" }); // id = `${date}__${line}`
+      }
+    };
+    req.onsuccess = (ev) => { dbInstance = ev.target.result; resolve(dbInstance); };
+    req.onerror = (ev) => reject(ev.target.error);
+  });
+}
+
+function txStore(storeName, mode = "readonly") {
+  return openDb().then((db) => db.transaction(storeName, mode).objectStore(storeName));
+}
+
+const Store = {
+  async getAll(storeName) {
+    const store = await txStore(storeName);
+    return new Promise((resolve, reject) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  async get(storeName, key) {
+    const store = await txStore(storeName);
+    return new Promise((resolve, reject) => {
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  async put(storeName, value) {
+    const store = await txStore(storeName, "readwrite");
+    return new Promise((resolve, reject) => {
+      const req = store.put(value);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  async delete(storeName, key) {
+    const store = await txStore(storeName, "readwrite");
+    return new Promise((resolve, reject) => {
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  async clear(storeName) {
+    const store = await txStore(storeName, "readwrite");
+    return new Promise((resolve, reject) => {
+      const req = store.clear();
+      req.onsuccess = () => resolve();
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+};
+
+async function getSetting(key, fallback) {
+  const rec = await Store.get("settings", key);
+  return rec ? rec.value : fallback;
+}
+async function setSetting(key, value) {
+  return Store.put("settings", { key, value });
+}
+
+/* ---------------------------------------------------------
+   3b. مخزن فروش روزانه (salesLog) — تجمعی خودکار ماهانه
+   --------------------------------------------------------- */
+/** Saves (or overwrites, if the same date+line was already saved) one
+ * line's full daily breakdown (per group + total) under its Shamsi date. */
+async function saveDailySaleFull(dateStr, line, rows, totalToday) {
+  return Store.put("salesLog", {
+    id: `${dateStr}__${line}`,
+    date: dateStr,
+    line,
+    rows: rows.map((r) => ({ groupId: r.groupId, todaySale: r.todaySale })),
+    totalToday,
+  });
+}
+
+/**
+ * Cumulative sale for `line`, from the configured monthBaseline through
+ * (and including) `uptoDateStr` — both per product-group and as a line
+ * total. If no entry for `uptoDateStr` has been saved yet (e.g. today,
+ * before pressing "ذخیره فروش روز"), it's simply not counted yet — callers
+ * add today's not-yet-saved amount on top when needed.
+ *
+ * Note: the manual mid-month baseline (تنظیمات > نقطه شروع تجمعی ماه) is a
+ * single total figure per line, not broken down per group — so it only
+ * seeds the line TOTAL's cumulative. Per-group cumulative starts counting
+ * from whichever day the app began saving daily reports.
+ */
+async function getMonthCumulativeRows(line, uptoDateStr) {
+  const monthPrefix = uptoDateStr.slice(0, 7); // "YYYY/MM"
+  const baseline = state.monthBaseline[line] || { date: "", amount: 0 };
+  const all = await Store.getAll("salesLog");
+  const logs = all.filter((e) => e.line === line && e.date.slice(0, 7) === monthPrefix && e.date <= uptoDateStr &&
+    (!baseline.date || e.date > baseline.date));
+  const byGroup = {};
+  let total = 0;
+  for (const e of logs) {
+    total += e.totalToday || 0;
+    (e.rows || []).forEach((r) => { byGroup[r.groupId] = (byGroup[r.groupId] || 0) + (r.todaySale || 0); });
+  }
+  const baseAmount = baseline.date && baseline.date.slice(0, 7) === monthPrefix ? (baseline.amount || 0) : (baseline.date ? 0 : (baseline.amount || 0));
+  total += baseAmount;
+  return { byGroup, total };
+}
+
+/* ---------------------------------------------------------
+   4. App state (in-memory cache, hydrated from IndexedDB)
+   --------------------------------------------------------- */
+/** Default appearance for the two "گزارش کامل روز" report images — colors
+ * sampled from the user's own sample Excel report so the first-run output
+ * matches it; every value is user-editable afterwards from تنظیمات. */
+const DEFAULT_REPORT_STYLE = {
+  titleFontFamily: "Vazirmatn",
+  headerFontFamily: "Vazirmatn",
+  bodyFontFamily: "Vazirmatn",
+  footerFontFamily: "Vazirmatn",
+  titleSize: 20,
+  headerSize: 15,
+  bodySize: 15,
+  footerSize: 15,
+  // right-to-left display order + per-column relative width + editable label
+  columnOrder: ["product", "target", "today", "cumulative", "remaining"],
+  columnWeights: { product: 24, target: 19, today: 19, cumulative: 19, remaining: 19 },
+  columnLabels: { product: "کالا", target: "هدف ماه", today: "فروش امروز", cumulative: "فروش از ابتدای ماه", remaining: "مانده تا هدف" },
+  // right-to-left display order + relative width + editable label for the footer stats row
+  footerOrder: ["customer", "perRep", "invalid"],
+  footerWeights: { customer: 2, perRep: 1, invalid: 2 },
+  footerLabels: { customer: "مشتری امروز", perRep: "سرانه", invalid: "درصد ابطالی" },
+  titleTemplate: "گزارش فروش {line}",
+  dateTemplate: "تاریخ: {date}",
+  rowHeights: { title: 46, header: 36, data: 32, total: 36, footer: 36 },
+  dateCellBg: "#002d82",
+  dateCellText: "#ffffff",
+  titleCellBg: "#9bc1e6",
+  titleCellText: "#0b3f73",
+  headerRowBg: "#fce5d7",
+  headerRowText: "#0b3f73",
+  dataRowBg: "#ffffff",
+  dataRowText: "#172b3a",
+  totalRowBg: "#ddebf6",
+  totalRowText: "#0b3f73",
+  remainingPositiveText: "#16a34a",
+  remainingNegativeText: "#dc2626",
+  footerCustomerBg: "#ffff00",
+  footerCustomerText: "#000000",
+  footerPerRepBg: "#ffc000",
+  footerPerRepText: "#000000",
+  footerInvalidBg: "#00af50",
+  footerInvalidText: "#ffffff",
+  borderColor: "#94a3b8",
+};
+
+const REPORT_COLUMN_KEYS = ["product", "target", "today", "cumulative", "remaining"];
+const REPORT_FOOTER_KEYS = ["customer", "perRep", "invalid"];
+
+/** Fills in any missing/malformed pieces of a saved reportStyle (e.g. from
+ * before column/footer reordering existed, or a corrupted order array) with
+ * their defaults, so drawReportCanvas can always assume a complete, valid
+ * shape. */
+function sanitizeReportStyle(raw) {
+  const s = { ...DEFAULT_REPORT_STYLE, ...(raw || {}) };
+  s.columnWeights = { ...DEFAULT_REPORT_STYLE.columnWeights, ...(raw?.columnWeights && !Array.isArray(raw.columnWeights) ? raw.columnWeights : {}) };
+  s.columnLabels = { ...DEFAULT_REPORT_STYLE.columnLabels, ...(raw?.columnLabels || {}) };
+  s.columnOrder = Array.isArray(raw?.columnOrder) && REPORT_COLUMN_KEYS.every((k) => raw.columnOrder.includes(k)) && raw.columnOrder.length === REPORT_COLUMN_KEYS.length
+    ? raw.columnOrder
+    : [...DEFAULT_REPORT_STYLE.columnOrder];
+  s.footerWeights = { ...DEFAULT_REPORT_STYLE.footerWeights, ...(raw?.footerWeights || {}) };
+  s.footerLabels = { ...DEFAULT_REPORT_STYLE.footerLabels, ...(raw?.footerLabels || {}) };
+  s.footerOrder = Array.isArray(raw?.footerOrder) && REPORT_FOOTER_KEYS.every((k) => raw.footerOrder.includes(k)) && raw.footerOrder.length === REPORT_FOOTER_KEYS.length
+    ? raw.footerOrder
+    : [...DEFAULT_REPORT_STYLE.footerOrder];
+  s.rowHeights = { ...DEFAULT_REPORT_STYLE.rowHeights, ...(raw?.rowHeights || {}) };
+  return s;
+}
+
+/** A small built-in sample dataset, used to render the settings live-preview
+ * before the user has ever generated a real report. */
+const SAMPLE_PREVIEW_REPORT_DATA = {
+  lineLabel: "لاین یک",
+  dateStr: "1405/06/08",
+  rows: [
+    { name: "شوینده", target: 30552, todaySale: 2116, cumulative: 3871, remaining: 3871 - 30552, sellByUnit: false },
+    { name: "اکشن", target: 2804, todaySale: 37, cumulative: 123, remaining: 123 - 2804, sellByUnit: false },
+    { name: "پاستیل", target: 4950, todaySale: 95, cumulative: 242, remaining: 242 - 4950, sellByUnit: true },
+  ],
+  totalToday: 2248,
+  totalCumulative: 4236,
+  targetTotal: 38306,
+  totalRemaining: 4236 - 38306,
+  customerCount: 351,
+  perRep: 70.2,
+  invalidPct: "14.04",
+};
+
+const state = {
+  groups: [],           // [{id, name, order}]
+  products: [],          // [{code, group, cartonQty}]
+  columnMap: { code: "", qty: "", carton: "", line: "", customer: "", invoice: "" },
+  lines: {
+    line1: { label: "لاین یک", excelValue: "" },
+    line2: { label: "لاین دو", excelValue: "" },
+  },
+  lineGroups: { line1: [], line2: [] }, // arrays of group ids
+  fontScale: 1.1,
+  salesWorkbookSheet: null, // current parsed worksheet (for report)
+  salesFileLoaded: false,
+
+  // ---- SalesFlow نسخه ۲ additions ----
+  monthlyTargets: { line1: {}, line2: {} },  // { line1: {groupId: number}, line2: {...} }
+  targetTotals: { line1: 0, line2: 0 },       // separately-announced total target per line
+  sellersCount: { line1: 0, line2: 0 },
+  monthBaseline: {                             // مبدأ تجمعی ماه، برای شروع از وسط ماه
+    line1: { date: "", amount: 0 },
+    line2: { date: "", amount: 0 },
+  },
+  reportStyle: { ...DEFAULT_REPORT_STYLE },
+};
+
+async function hydrateState() {
+  state.groups = (await Store.getAll("groups")).sort((a, b) => a.order - b.order);
+  state.products = await Store.getAll("products");
+  // shallow-merge over defaults so older saved settings (from before a field
+  // like "invoice" existed) don't lose the new key entirely.
+  state.columnMap = { ...state.columnMap, ...(await getSetting("columnMap", {})) };
+  state.lines = await getSetting("lines", state.lines);
+  state.lineGroups = await getSetting("lineGroups", state.lineGroups);
+  state.fontScale = await getSetting("fontScale", 1.1);
+
+  state.monthlyTargets = await getSetting("monthlyTargets", state.monthlyTargets);
+  state.targetTotals = await getSetting("targetTotals", state.targetTotals);
+  state.sellersCount = await getSetting("sellersCount", state.sellersCount);
+  state.monthBaseline = await getSetting("monthBaseline", state.monthBaseline);
+  state.reportStyle = sanitizeReportStyle(await getSetting("reportStyle", {}));
+}
+
+function groupById(id) { return state.groups.find((g) => g.id === id); }
+function groupByName(name) { return state.groups.find((g) => g.name === name); }
+function productCountForGroup(groupId) {
+  return state.products.filter((p) => p.group === groupId).length;
+}
+
+/* ---------------------------------------------------------
+   5. Navigation
+   --------------------------------------------------------- */
+function switchView(viewKey) {
+  $all(".nav-item").forEach((btn) => btn.classList.toggle("active", btn.dataset.view === viewKey));
+  $all(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${viewKey}`));
+  $(".view-scroll").scrollTo({ top: 0, behavior: "instant" });
+}
+
+function switchManagementTab(tabKey) {
+  $all("#management-tabs .tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.mtab === tabKey));
+  $all(".mtab-panel").forEach((p) => (p.style.display = p.id === `mtab-${tabKey}` ? "" : "none"));
+}
+
+/* ---------------------------------------------------------
+   6. GROUPS management (add / reorder / delete)
+   --------------------------------------------------------- */
+function renderGroupAddForm() {
+  const slot = $("#group-add-form-slot");
+  slot.innerHTML = `
+    <div style="margin-bottom: var(--space-5); display:none" id="group-add-row">
+      <div class="row">
+        <div class="field" style="flex:1">
+          <input type="text" id="new-group-name" placeholder="نام گروه کالا را وارد کنید" />
+          <div class="field-error" id="group-add-error" style="display:none"></div>
+        </div>
+        <button class="btn btn-primary" id="btn-confirm-add-group">افزودن</button>
+        <button class="btn btn-secondary" id="btn-cancel-add-group">انصراف</button>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="new-group-nonsellable" />
+        <label for="new-group-nonsellable">غیرقابل فروش (مثل استند) — این گروه هرگز جزو فروش و تعداد مشتری حساب نشود</label>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="new-group-sellbyunit" />
+        <label for="new-group-sellbyunit">فروش به قوطی — گزارش این گروه با واحد کوچک (تعداد خام) محاسبه شود، نه تقسیم بر تعداد در کارتن</label>
+      </div>
+    </div>`;
+}
+
+function toggleGroupAddRow(show) {
+  const row = $("#group-add-row");
+  row.style.display = show ? "block" : "none";
+  if (show) {
+    $("#new-group-name").value = "";
+    $("#new-group-nonsellable").checked = false;
+    $("#new-group-sellbyunit").checked = false;
+    $("#group-add-error").style.display = "none";
+    $("#new-group-name").focus();
+  }
+}
+
+async function handleAddGroup() {
+  const input = $("#new-group-name");
+  const errorEl = $("#group-add-error");
+  const nonSellable = $("#new-group-nonsellable").checked;
+  const sellByUnit = $("#new-group-sellbyunit").checked;
+  const name = normalizeStr(input.value);
+  if (!name) {
+    errorEl.textContent = "نام گروه کالا را وارد کنید.";
+    errorEl.style.display = "block";
+    return;
+  }
+  const duplicate = state.groups.some((g) => g.name === name);
+  if (duplicate) {
+    errorEl.textContent = "⚠️ این گروه کالا قبلاً ثبت شده است.";
+    errorEl.style.display = "block";
+    return;
+  }
+  const maxOrder = state.groups.reduce((m, g) => Math.max(m, g.order), -1);
+  const rec = { name, order: maxOrder + 1, nonSellable, sellByUnit };
+  const id = await Store.put("groups", rec);
+  rec.id = id;
+  state.groups.push(rec);
+  toggleGroupAddRow(false);
+  showToast("گروه کالا با موفقیت اضافه شد", "success");
+  renderGroupsList();
+  refreshAllGroupDependentUI();
+}
+
+async function handleToggleGroupNonSellable(id) {
+  const group = groupById(id);
+  if (!group) return;
+  group.nonSellable = !group.nonSellable;
+  await Store.put("groups", group);
+  if (group.nonSellable) {
+    // a group just marked non-sellable can no longer be part of any line's
+    // report definition — strip it out and persist the cleanup.
+    state.lineGroups.line1 = state.lineGroups.line1.filter((gid) => gid !== id);
+    state.lineGroups.line2 = state.lineGroups.line2.filter((gid) => gid !== id);
+    await setSetting("lineGroups", state.lineGroups);
+  }
+  showToast(
+    group.nonSellable ? "گروه به‌عنوان «غیرقابل فروش» علامت‌گذاری شد" : "گروه به فروش عادی بازگشت",
+    "success"
+  );
+  renderGroupsList();
+  refreshAllGroupDependentUI();
+}
+
+async function handleToggleGroupSellByUnit(id) {
+  const group = groupById(id);
+  if (!group) return;
+  group.sellByUnit = !group.sellByUnit;
+  await Store.put("groups", group);
+  showToast(
+    group.sellByUnit ? "گروه به‌صورت «فروش به قوطی» محاسبه می‌شود" : "گروه به محاسبه بر اساس کارتن بازگشت",
+    "success"
+  );
+  renderGroupsList();
+}
+
+function renderGroupsList() {
+  const slot = $("#groups-list-slot");
+  if (!state.groups.length) {
+    slot.innerHTML = `
+      <div class="empty-state">
+        <div class="icon"><svg><use href="#icon-box"></use></svg></div>
+        <div class="title">هنوز گروهی ثبت نشده است</div>
+        <div>با دکمه «افزودن گروه کالا» شروع کنید</div>
+      </div>`;
+    return;
+  }
+  const sorted = [...state.groups].sort((a, b) => a.order - b.order);
+  slot.innerHTML = `<div class="order-list" id="order-list">${sorted
+    .map(
+      (g, idx) => `
+      <div class="order-item" draggable="true" data-group-id="${g.id}">
+        <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
+        <span class="name" data-open-group="${g.id}" style="cursor:pointer">${escapeHtml(g.name)}</span>
+        ${g.nonSellable ? `<span class="badge badge-neutral">غیرقابل فروش</span>` : ""}
+        ${g.sellByUnit ? `<span class="badge badge-neutral">فروش به قوطی</span>` : ""}
+        <span class="count">${productCountForGroup(g.id)} کالا</span>
+        <div class="move-btns">
+          <button class="btn btn-icon btn-sm btn-secondary" data-move="up" data-id="${g.id}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
+          <button class="btn btn-icon btn-sm btn-secondary" data-move="down" data-id="${g.id}" ${idx === sorted.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
+        </div>
+        <button class="btn btn-sm btn-secondary" data-toggle-sellbyunit="${g.id}">${g.sellByUnit ? "بازگشت به کارتن" : "فروش به قوطی"}</button>
+        <button class="btn btn-sm btn-secondary" data-toggle-nonsellable="${g.id}">${g.nonSellable ? "بازگشت به فروش عادی" : "غیرقابل فروش"}</button>
+        <button class="btn btn-icon btn-sm btn-danger" data-delete-group="${g.id}"><svg width="15" height="15"><use href="#icon-trash"></use></svg></button>
+      </div>`
+    )
+    .join("")}</div>`;
+
+  // move buttons
+  $all("[data-move]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => moveGroup(Number(btn.dataset.id), btn.dataset.move));
+  });
+  // delete buttons
+  $all("[data-delete-group]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => handleDeleteGroup(Number(btn.dataset.deleteGroup)));
+  });
+  // non-sellable toggle
+  $all("[data-toggle-nonsellable]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => handleToggleGroupNonSellable(Number(btn.dataset.toggleNonsellable)));
+  });
+  // sell-by-unit toggle
+  $all("[data-toggle-sellbyunit]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => handleToggleGroupSellByUnit(Number(btn.dataset.toggleSellbyunit)));
+  });
+  // open group products modal
+  $all("[data-open-group]", slot).forEach((el) => {
+    el.addEventListener("click", () => openGroupProductsModal(Number(el.dataset.openGroup)));
+  });
+  // drag & drop reordering
+  let dragId = null;
+  $all(".order-item", slot).forEach((item) => {
+    item.addEventListener("dragstart", () => {
+      dragId = Number(item.dataset.groupId);
+      item.classList.add("dragging");
+    });
+    item.addEventListener("dragend", () => item.classList.remove("dragging"));
+    item.addEventListener("dragover", (e) => e.preventDefault());
+    item.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      const targetId = Number(item.dataset.groupId);
+      if (dragId === null || dragId === targetId) return;
+      await reorderGroups(dragId, targetId);
+    });
+  });
+}
+
+async function moveGroup(id, direction) {
+  const sorted = [...state.groups].sort((a, b) => a.order - b.order);
+  const idx = sorted.findIndex((g) => g.id === id);
+  const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= sorted.length) return;
+  const a = sorted[idx], b = sorted[swapIdx];
+  const tmp = a.order; a.order = b.order; b.order = tmp;
+  await Store.put("groups", a);
+  await Store.put("groups", b);
+  renderGroupsList();
+}
+
+async function reorderGroups(dragId, targetId) {
+  const sorted = [...state.groups].sort((a, b) => a.order - b.order);
+  const fromIdx = sorted.findIndex((g) => g.id === dragId);
+  const toIdx = sorted.findIndex((g) => g.id === targetId);
+  const [moved] = sorted.splice(fromIdx, 1);
+  sorted.splice(toIdx, 0, moved);
+  for (let i = 0; i < sorted.length; i++) {
+    sorted[i].order = i;
+    await Store.put("groups", sorted[i]);
+  }
+  renderGroupsList();
+}
+
+async function handleDeleteGroup(id) {
+  const group = groupById(id);
+  if (!group) return;
+  const count = productCountForGroup(id);
+  if (count > 0) {
+    const ok = await confirmModal({
+      icon: "alert-triangle",
+      title: "هشدار حذف گروه",
+      body: `با حذف گروه «${escapeHtml(group.name)}»، تمام کدهای کالای مربوط به این گروه نیز حذف خواهند شد. آیا مطمئن هستید؟`,
+      confirmLabel: "حذف گروه و کالاها",
+      confirmClass: "btn-danger",
+    });
+    if (!ok) return;
+    const toDelete = state.products.filter((p) => p.group === id);
+    for (const p of toDelete) await Store.delete("products", p.code);
+    state.products = state.products.filter((p) => p.group !== id);
+  }
+  await Store.delete("groups", id);
+  state.groups = state.groups.filter((g) => g.id !== id);
+  // clean up line-group selections referencing this group
+  state.lineGroups.line1 = state.lineGroups.line1.filter((gid) => gid !== id);
+  state.lineGroups.line2 = state.lineGroups.line2.filter((gid) => gid !== id);
+  await setSetting("lineGroups", state.lineGroups);
+  showToast("گروه کالا حذف شد", "success");
+  renderGroupsList();
+  refreshAllGroupDependentUI();
+}
+
+function openGroupProductsModal(groupId) {
+  const group = groupById(groupId);
+  if (!group) return;
+  const region = $("#modal-region");
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:520px">
+      <div class="modal-title">${escapeHtml(group.name)}</div>
+      <div class="card-subtitle" style="margin-bottom:var(--space-4)">تعداد کالا: ${productCountForGroup(groupId)}</div>
+      <div class="search-input-wrap" style="margin-bottom:var(--space-4)">
+        <input type="text" id="group-modal-search" placeholder="جستجوی کد کالا..." />
+        <span class="icon"><svg><use href="#icon-search"></use></svg></span>
+      </div>
+      <div class="table-wrap" style="max-height:320px">
+        <table class="data-table"><thead><tr><th>کد کالا</th><th class="num">تعداد در کارتن</th></tr></thead>
+        <tbody id="group-modal-tbody"></tbody></table>
+      </div>
+      <div class="modal-actions" style="margin-top:var(--space-5)">
+        <button class="btn btn-secondary" id="group-modal-close">بستن</button>
+        <button class="btn btn-primary" id="group-modal-add">${icon("plus")} افزودن کالا به این گروه</button>
+      </div>
+    </div>`;
+  region.appendChild(overlay);
+
+  function renderRows(filter) {
+    const rows = state.products
+      .filter((p) => p.group === groupId)
+      .filter((p) => !filter || p.code.toLowerCase().includes(filter.toLowerCase()));
+    const tbody = $("#group-modal-tbody", overlay);
+    tbody.innerHTML = rows.length
+      ? rows.map((p) => `<tr><td>${escapeHtml(p.code)}</td><td class="num">${formatNumber(p.cartonQty)}</td></tr>`).join("")
+      : `<tr><td colspan="2" style="text-align:center;color:var(--color-text-faint)">موردی یافت نشد</td></tr>`;
+  }
+  renderRows("");
+  $("#group-modal-search", overlay).addEventListener("input", (e) => renderRows(e.target.value));
+  $("#group-modal-close", overlay).addEventListener("click", () => overlay.remove());
+  $("#group-modal-add", overlay).addEventListener("click", () => {
+    overlay.remove();
+    switchView("management");
+    switchManagementTab("products");
+    $all("#product-entry-tabs .tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.ptab === "manual"));
+    $("#ptab-excel").style.display = "none";
+    $("#ptab-manual").style.display = "";
+    populateManualGroupSelect();
+    $("#manual-product-group").value = String(groupId);
+    $("#manual-product-code").focus();
+  });
+}
+
+function refreshAllGroupDependentUI() {
+  populateManualGroupSelect();
+  renderLineGroupCheckboxes();
+  populateSingleReportSelectors();
+}
+
+/* ---------------------------------------------------------
+   7. PRODUCTS management (manual entry + Excel import + list)
+   --------------------------------------------------------- */
+function populateManualGroupSelect() {
+  const sel = $("#manual-product-group");
+  if (!sel) return;
+  const sorted = [...state.groups].sort((a, b) => a.order - b.order);
+  sel.innerHTML = sorted.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join("");
+  if (!sorted.length) sel.innerHTML = `<option value="">— ابتدا گروه کالا تعریف کنید —</option>`;
+}
+
+async function handleSaveManualProduct() {
+  const codeInput = $("#manual-product-code");
+  const groupSel = $("#manual-product-group");
+  const cartonInput = $("#manual-product-carton");
+  const errorSlot = $("#manual-product-error-slot");
+  errorSlot.innerHTML = "";
+
+  const code = normalizeStr(codeInput.value);
+  const groupId = Number(groupSel.value);
+  const carton = toPersianSafeNumber(cartonInput.value);
+
+  if (!state.groups.length) {
+    errorSlot.innerHTML = `<div class="field-error">ابتدا باید حداقل یک گروه کالا تعریف کنید.</div>`;
+    return;
+  }
+  if (!code) {
+    errorSlot.innerHTML = `<div class="field-error">کد کالا را وارد کنید.</div>`;
+    return;
+  }
+  const existing = state.products.find((p) => p.code === code);
+  if (existing) {
+    errorSlot.innerHTML = `<div class="field-error">⚠️ این کد کالا قبلاً ثبت شده است.</div>`;
+    return;
+  }
+  if (!groupId) {
+    errorSlot.innerHTML = `<div class="field-error">گروه کالا را انتخاب کنید.</div>`;
+    return;
+  }
+  if (isNaN(carton) || carton <= 0) {
+    errorSlot.innerHTML = `<div class="field-error">تعداد در کارتن باید عددی بزرگ‌تر از صفر باشد.</div>`;
+    return;
+  }
+  const rec = { code, group: groupId, cartonQty: carton };
+  await Store.put("products", rec);
+  state.products.push(rec);
+  codeInput.value = "";
+  cartonInput.value = "";
+  showToast("کالا با موفقیت ذخیره شد", "success");
+  renderProductsList();
+  renderGroupsList();
+}
+
+function renderProductsList(filterText) {
+  const slot = $("#products-table-slot");
+  const sub = $("#products-count-sub");
+  sub.textContent = `${state.products.length.toLocaleString("fa-IR")} کالا ثبت شده`;
+  let list = state.products;
+  if (filterText) {
+    const f = filterText.toLowerCase();
+    list = list.filter((p) => {
+      const g = groupById(p.group);
+      return p.code.toLowerCase().includes(f) || (g && g.name.toLowerCase().includes(f));
+    });
+  }
+  if (!list.length) {
+    slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-list"></use></svg></div><div class="title">موردی یافت نشد</div></div>`;
+    return;
+  }
+  list = [...list].sort((a, b) => a.code.localeCompare(b.code, "en"));
+  slot.innerHTML = `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr><th>کد کالا</th><th>گروه کالا</th><th class="num">تعداد در کارتن</th><th>عملیات</th></tr></thead>
+        <tbody>
+          ${list
+            .map((p) => {
+              const g = groupById(p.group);
+              return `<tr>
+                <td>${escapeHtml(p.code)}</td>
+                <td>${g ? escapeHtml(g.name) : "—"}</td>
+                <td class="num">${formatNumber(p.cartonQty)}</td>
+                <td><button class="btn btn-icon btn-sm btn-danger" data-delete-product="${escapeHtml(p.code)}"><svg width="15" height="15"><use href="#icon-trash"></use></svg></button></td>
+              </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>`;
+  $all("[data-delete-product]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => handleDeleteProduct(btn.dataset.deleteProduct));
+  });
+}
+
+async function handleDeleteProduct(code) {
+  const ok = await confirmModal({
+    icon: "trash",
+    title: "حذف کالا",
+    body: `آیا از حذف کد کالا «${escapeHtml(code)}» مطمئن هستید؟`,
+    confirmLabel: "حذف کالا",
+  });
+  if (!ok) return;
+  await Store.delete("products", code);
+  state.products = state.products.filter((p) => p.code !== code);
+  showToast("کالا حذف شد", "success");
+  renderProductsList($("#products-search").value);
+  renderGroupsList();
+}
+
+/* ----- Excel import for products ----- */
+async function handleProductsFileSelected(file) {
+  $("#products-file-status").textContent = "";
+  $("#products-file-status").className = "file-drop-status";
+  if (!file) return;
+  let workbook;
+  try {
+    const buf = await file.arrayBuffer();
+    workbook = readWorkbookSmart(buf);
+  } catch (err) {
+    showToast("خطا در خواندن فایل", "error");
+    return;
+  }
+  const sheetName = workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  if (!ws || !ws["!ref"]) {
+    showToast("فایل معتبر نیست", "error");
+    return;
+  }
+  const rows = XLSX.utils.sheet_to_json(ws, { header: "A", raw: true, defval: "" });
+  const dataRows = rows.slice(1); // skip header row
+
+  let registered = 0, duplicate = 0, invalid = 0;
+  let blankRows = 0, missingFieldRows = 0, undefinedGroupRows = 0, invalidCartonRows = 0;
+  const undefinedGroups = new Set();
+  const groupNameToId = new Map(state.groups.map((g) => [g.name, g.id]));
+  const seenCodes = new Set(state.products.map((p) => p.code));
+
+  for (const row of dataRows) {
+    const code = normalizeStr(row.A);
+    const groupName = normalizeStr(row.B);
+    const cartonRaw = normalizeStr(row.C);
+    const carton = toPersianSafeNumber(row.C);
+
+    // Excel often applies formatting (borders/background) far below the
+    // real data, which stretches the sheet's used range and produces
+    // hundreds/thousands of phantom fully-empty rows. These are not real
+    // import attempts, so they're skipped silently instead of counted.
+    if (!code && !groupName && !cartonRaw) { blankRows++; continue; }
+
+    if (!code || !groupName) { invalid++; missingFieldRows++; continue; }
+    if (!groupNameToId.has(groupName)) { undefinedGroups.add(groupName); invalid++; undefinedGroupRows++; continue; }
+    if (isNaN(carton) || carton <= 0) { invalid++; invalidCartonRows++; continue; }
+    if (seenCodes.has(code)) { duplicate++; continue; }
+
+    const rec = { code, group: groupNameToId.get(groupName), cartonQty: carton };
+    await Store.put("products", rec);
+    state.products.push(rec);
+    seenCodes.add(code);
+    registered++;
+  }
+
+  $("#products-file-status").textContent = "فایل بررسی شد";
+  $("#products-file-status").className = "file-drop-status ok";
+  renderProductsList();
+  renderGroupsList();
+
+  const reasonLines = [];
+  if (missingFieldRows) reasonLines.push(`کد یا گروه کالا خالی: ${missingFieldRows.toLocaleString("fa-IR")} ردیف`);
+  if (undefinedGroupRows) reasonLines.push(`گروه تعریف‌نشده: ${undefinedGroupRows.toLocaleString("fa-IR")} ردیف`);
+  if (invalidCartonRows) reasonLines.push(`تعداد در کارتن نامعتبر (خالی، صفر یا منفی): ${invalidCartonRows.toLocaleString("fa-IR")} ردیف`);
+
+  openModal({
+    icon: registered > 0 ? "check-circle" : "alert-triangle",
+    title: "نتیجه ورود کالا از Excel",
+    body: `
+      <div class="stack">
+        <div class="row-between"><span>تعداد ثبت‌شده</span><span class="badge badge-success">${registered.toLocaleString("fa-IR")}</span></div>
+        <div class="row-between"><span>تعداد تکراری</span><span class="badge badge-warning">${duplicate.toLocaleString("fa-IR")}</span></div>
+        <div class="row-between"><span>تعداد نامعتبر</span><span class="badge badge-danger">${invalid.toLocaleString("fa-IR")}</span></div>
+      </div>
+      ${reasonLines.length ? `<div class="field-hint" style="margin-top:var(--space-4);text-align:right">علت نامعتبر بودن:<br>${reasonLines.join("<br>")}</div>` : ""}`,
+    listItems: undefinedGroups.size
+      ? [`گروه‌های تعریف‌نشده: ${Array.from(undefinedGroups).join("، ")}`]
+      : null,
+    actions: [{ label: "باشه", className: "btn-primary" }],
+  });
+}
+
+/* ---------------------------------------------------------
+   8. تعریف گزارش کلی — per-line group selection AND ordering
+   --------------------------------------------------------- */
+// Working (unsaved) order per line while the user is editing this screen.
+// Each is an array of group ids: included groups in the exact order they
+// will appear in that line's report ("مجموع" is always appended last
+// separately, never stored in this array).
+const pendingLineOrder = { line1: [], line2: [] };
+
+function initPendingLineOrder(lineKey) {
+  // keep previously-saved order, drop any group that no longer exists or
+  // has since been marked "غیرقابل فروش" (non-sellable groups can never
+  // contribute to a report, so they don't belong in a line's definition).
+  const sellableIds = new Set(state.groups.filter((g) => !g.nonSellable).map((g) => g.id));
+  pendingLineOrder[lineKey] = (state.lineGroups[lineKey] || []).filter((id) => sellableIds.has(id));
+}
+
+function renderLineGroupCheckboxes() {
+  const globalSorted = [...state.groups].filter((g) => !g.nonSellable).sort((a, b) => a.order - b.order);
+  ["line1", "line2"].forEach((lineKey) => {
+    initPendingLineOrder(lineKey);
+    renderLineOrderList(lineKey, globalSorted);
+  });
+}
+
+function renderLineOrderList(lineKey, globalSorted) {
+  const slot = $(`#${lineKey}-groups-slot`);
+  if (!slot) return;
+  if (!globalSorted.length) {
+    slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-box"></use></svg></div><div class="title">ابتدا گروه کالا تعریف کنید</div></div>`;
+    return;
+  }
+
+  const selectedIds = pendingLineOrder[lineKey];
+  const selectedSet = new Set(selectedIds);
+  const selectedGroups = selectedIds.map((id) => groupById(id)).filter(Boolean);
+  const unselectedGroups = globalSorted.filter((g) => !selectedSet.has(g.id));
+
+  const selectedHtml = selectedGroups.length
+    ? `<div class="order-list" data-line-order-list="${lineKey}">${selectedGroups
+        .map(
+          (g, idx) => `
+          <div class="order-item" draggable="true" data-line="${lineKey}" data-group-id="${g.id}">
+            <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
+            <input type="checkbox" data-line-toggle="${lineKey}" data-group-id="${g.id}" checked />
+            <span class="name">${escapeHtml(g.name)}</span>
+            <div class="move-btns">
+              <button class="btn btn-icon btn-sm btn-secondary" data-line-move="up" data-line="${lineKey}" data-group-id="${g.id}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
+              <button class="btn btn-icon btn-sm btn-secondary" data-line-move="down" data-line="${lineKey}" data-group-id="${g.id}" ${idx === selectedGroups.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
+            </div>
+          </div>`
+        )
+        .join("")}
+        <div class="order-item table-row-total" style="cursor:default">
+          <span class="name">مجموع</span>
+          <span class="count">همیشه آخرین ردیف گزارش</span>
+        </div>
+      </div>`
+    : `<div class="field-hint" style="margin-bottom:var(--space-3)">هنوز گروهی برای این لاین انتخاب نشده است</div>`;
+
+  const unselectedHtml = unselectedGroups.length
+    ? `<div class="card-section-label" style="margin-top:var(--space-4)">سایر گروه‌ها</div>
+       ${unselectedGroups
+         .map(
+           (g) => `
+        <div class="checkbox-row">
+          <input type="checkbox" id="${lineKey}-chk-${g.id}" data-line-toggle="${lineKey}" data-group-id="${g.id}" />
+          <label for="${lineKey}-chk-${g.id}">${escapeHtml(g.name)}</label>
+        </div>`
+         )
+         .join("")}`
+    : "";
+
+  slot.innerHTML = `
+    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره ⠿ یا دکمه‌های بالا/پایین ترتیب نمایش گروه‌ها در گزارش این لاین را تعیین کنید. ردیف «مجموع» همیشه آخرین ردیف باقی می‌ماند.</div>
+    ${selectedHtml}
+    ${unselectedHtml}`;
+
+  // toggle include/exclude
+  $all(`[data-line-toggle="${lineKey}"]`, slot).forEach((chk) => {
+    chk.addEventListener("change", () => {
+      const gid = Number(chk.dataset.groupId);
+      if (chk.checked) {
+        if (!pendingLineOrder[lineKey].includes(gid)) pendingLineOrder[lineKey].push(gid);
+      } else {
+        pendingLineOrder[lineKey] = pendingLineOrder[lineKey].filter((id) => id !== gid);
+      }
+      renderLineOrderList(lineKey, globalSorted);
+    });
+  });
+
+  // up/down reordering
+  $all(`[data-line-move]`, slot).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const gid = Number(btn.dataset.groupId);
+      const arr = pendingLineOrder[lineKey];
+      const idx = arr.indexOf(gid);
+      const swapIdx = btn.dataset.lineMove === "up" ? idx - 1 : idx + 1;
+      if (idx < 0 || swapIdx < 0 || swapIdx >= arr.length) return;
+      [arr[idx], arr[swapIdx]] = [arr[swapIdx], arr[idx]];
+      renderLineOrderList(lineKey, globalSorted);
+    });
+  });
+
+  // drag & drop reordering
+  let dragId = null;
+  $all(".order-item[draggable='true']", slot).forEach((item) => {
+    item.addEventListener("dragstart", () => {
+      dragId = Number(item.dataset.groupId);
+      item.classList.add("dragging");
+    });
+    item.addEventListener("dragend", () => item.classList.remove("dragging"));
+    item.addEventListener("dragover", (e) => e.preventDefault());
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const targetId = Number(item.dataset.groupId);
+      if (dragId === null || dragId === targetId) return;
+      const arr = pendingLineOrder[lineKey];
+      const fromIdx = arr.indexOf(dragId);
+      const toIdx = arr.indexOf(targetId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      const [moved] = arr.splice(fromIdx, 1);
+      arr.splice(toIdx, 0, moved);
+      renderLineOrderList(lineKey, globalSorted);
+    });
+  });
+}
+
+async function handleSaveLineGroups(lineKey) {
+  state.lineGroups[lineKey] = [...pendingLineOrder[lineKey]];
+  await setSetting("lineGroups", state.lineGroups);
+  showToast(`تنظیمات ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
+  renderTargetsTab(); // group selection changed — target rows follow it
+}
+
+/* ---------------------------------------------------------
+   8b. اهداف ماهانه (Management > Targets tab) — SalesFlow نسخه ۲
+   --------------------------------------------------------- */
+function renderTargetsTab() {
+  ["line1", "line2"].forEach((lineKey) => {
+    const slot = $(`#targets-${lineKey}-slot`);
+    if (!slot) return;
+    const ids = state.lineGroups[lineKey] || [];
+    const groups = ids.map((id) => groupById(id)).filter(Boolean);
+    const targets = state.monthlyTargets[lineKey] || {};
+    if (!groups.length) {
+      slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-target"></use></svg></div><div class="title">ابتدا گروه‌های این لاین را در «تعریف گزارش کلی» انتخاب کنید</div></div>`;
+      return;
+    }
+    slot.innerHTML = `
+      <div class="order-list">
+        ${groups
+          .map(
+            (g) => `
+          <div class="order-item" style="cursor:default">
+            <span class="name">${escapeHtml(g.name)}</span>
+            <input type="number" min="0" step="1" class="target-input" data-target-group="${g.id}" data-target-line="${lineKey}"
+              value="${targets[g.id] != null ? targets[g.id] : ""}" placeholder="هدف" style="width:120px" />
+          </div>`
+          )
+          .join("")}
+        <div class="order-item table-row-total" style="cursor:default">
+          <span class="name">مجموع هدف ${lineKey === "line1" ? "لاین یک" : "لاین دو"}</span>
+          <input type="number" min="0" step="1" id="target-total-${lineKey}" style="width:120px"
+            value="${state.targetTotals[lineKey] || ""}" placeholder="مجموع هدف" />
+        </div>
+      </div>`;
+  });
+}
+
+async function handleSaveTargets(lineKey) {
+  const slot = $(`#targets-${lineKey}-slot`);
+  if (!slot) return;
+  const newTargets = {};
+  $all(`[data-target-line="${lineKey}"]`, slot).forEach((input) => {
+    const gid = Number(input.dataset.targetGroup);
+    const v = toPersianSafeNumber(input.value);
+    if (!isNaN(v)) newTargets[gid] = v;
+  });
+  state.monthlyTargets[lineKey] = newTargets;
+  await setSetting("monthlyTargets", state.monthlyTargets);
+
+  const totalInput = $(`#target-total-${lineKey}`);
+  const totalVal = toPersianSafeNumber(totalInput ? totalInput.value : "");
+  state.targetTotals[lineKey] = isNaN(totalVal) ? 0 : totalVal;
+  await setSetting("targetTotals", state.targetTotals);
+
+  showToast(`اهداف ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
+}
+
+/* ---------------------------------------------------------
+   9. SETTINGS — columns, lines, appearance
+   --------------------------------------------------------- */
+function loadSettingsFormFromState() {
+  $("#col-code").value = state.columnMap.code || "";
+  $("#col-qty").value = state.columnMap.qty || "";
+  $("#col-carton").value = state.columnMap.carton || "";
+  $("#col-line").value = state.columnMap.line || "";
+  $("#col-customer").value = state.columnMap.customer || "";
+  $("#col-invoice").value = state.columnMap.invoice || "";
+  $("#line1-excel-value").value = state.lines.line1.excelValue || "";
+  $("#line2-excel-value").value = state.lines.line2.excelValue || "";
+  $all("#font-size-tabs .tab-btn").forEach((b) =>
+    b.classList.toggle("active", Number(b.dataset.fontScale) === state.fontScale)
+  );
+}
+
+async function handleSaveColumns() {
+  const fields = {
+    code: { input: $("#col-code"), label: "کد کالا" },
+    qty: { input: $("#col-qty"), label: "تعداد فروش" },
+    carton: { input: $("#col-carton"), label: "تعداد در کارتن" },
+    line: { input: $("#col-line"), label: "لاین" },
+    customer: { input: $("#col-customer"), label: "کد مشتری" },
+    invoice: { input: $("#col-invoice"), label: "شماره پیش‌فاکتور" },
+  };
+  const errorSlot = $("#columns-error-slot");
+  errorSlot.innerHTML = "";
+  const errors = [];
+  const newMap = {};
+  Object.entries(fields).forEach(([key, f]) => {
+    const v = normalizeStr(f.input.value).toUpperCase();
+    if (!isValidColumnLetter(v)) errors.push(`ستون «${f.label}» باید یک حرف معتبر ستون Excel باشد (مثلاً C).`);
+    newMap[key] = v;
+  });
+  if (errors.length) {
+    errorSlot.innerHTML = errors.map((e) => `<div class="field-error">${escapeHtml(e)}</div>`).join("");
+    return;
+  }
+  state.columnMap = newMap;
+  await setSetting("columnMap", state.columnMap);
+  showToast("تنظیمات ستون‌ها ذخیره شد", "success");
+}
+
+async function handleSaveLines() {
+  const v1 = normalizeStr($("#line1-excel-value").value);
+  const v2 = normalizeStr($("#line2-excel-value").value);
+  if (!v1 || !v2) {
+    showToast("مقدار دقیق Excel برای هر دو لاین باید وارد شود", "error");
+    return;
+  }
+  state.lines.line1.excelValue = v1;
+  state.lines.line2.excelValue = v2;
+  await setSetting("lines", state.lines);
+  showToast("تنظیمات لاین‌ها ذخیره شد", "success");
+}
+
+async function handleSetFontScale(scale) {
+  state.fontScale = scale;
+  document.documentElement.style.setProperty("--font-scale", String(scale));
+  await setSetting("fontScale", scale);
+  $all("#font-size-tabs .tab-btn").forEach((b) => b.classList.toggle("active", Number(b.dataset.fontScale) === scale));
+}
+
+/* ---------------------------------------------------------
+   9c. تعداد فروشنده / نقطه شروع تجمعی / ظاهر گزارش — SalesFlow نسخه ۲
+   --------------------------------------------------------- */
+function loadSellersFormFromState() {
+  $("#sellers-line1").value = state.sellersCount.line1 || "";
+  $("#sellers-line2").value = state.sellersCount.line2 || "";
+}
+async function handleSaveSellers() {
+  const v1 = toPersianSafeNumber($("#sellers-line1").value);
+  const v2 = toPersianSafeNumber($("#sellers-line2").value);
+  state.sellersCount = { line1: isNaN(v1) ? 0 : v1, line2: isNaN(v2) ? 0 : v2 };
+  await setSetting("sellersCount", state.sellersCount);
+  showToast("تعداد فروشنده هر لاین ذخیره شد", "success");
+}
+
+function renderBaselineForm() {
+  const slot = $("#baseline-form-slot");
+  if (!slot) return;
+  const b1 = state.monthBaseline.line1 || { date: "", amount: 0 };
+  const b2 = state.monthBaseline.line2 || { date: "", amount: 0 };
+  slot.innerHTML = `
+    <div class="form-grid">
+      <div class="field">
+        <label><span class="line-dot line1"></span> تاریخ مبدأ لاین یک (مثلاً 1405/05/24)</label>
+        <input type="text" id="baseline-date-line1" placeholder="خالی = ابتدای ماه" value="${escapeHtml(b1.date || "")}" />
+      </div>
+      <div class="field">
+        <label>فروش تا آن تاریخ — لاین یک</label>
+        <input type="number" id="baseline-amount-line1" min="0" step="1" value="${b1.amount || ""}" />
+      </div>
+      <div class="field">
+        <label><span class="line-dot line2"></span> تاریخ مبدأ لاین دو (مثلاً 1405/05/24)</label>
+        <input type="text" id="baseline-date-line2" placeholder="خالی = ابتدای ماه" value="${escapeHtml(b2.date || "")}" />
+      </div>
+      <div class="field">
+        <label>فروش تا آن تاریخ — لاین دو</label>
+        <input type="number" id="baseline-amount-line2" min="0" step="1" value="${b2.amount || ""}" />
+      </div>
+    </div>
+    <div class="row" style="margin-top: var(--space-5); flex-wrap:wrap">
+      <button class="btn btn-primary" id="btn-save-baseline">${icon("save")} ذخیره مبدأ تجمعی</button>
+      <button class="btn btn-secondary" id="btn-clear-baseline">${icon("trash")} شروع ماه جدید (صفر کردن)</button>
+    </div>`;
+  $("#btn-save-baseline").addEventListener("click", handleSaveBaseline);
+  $("#btn-clear-baseline").addEventListener("click", handleClearBaseline);
+}
+
+async function handleSaveBaseline() {
+  const d1 = normalizeStr($("#baseline-date-line1").value);
+  const a1 = toPersianSafeNumber($("#baseline-amount-line1").value);
+  const d2 = normalizeStr($("#baseline-date-line2").value);
+  const a2 = toPersianSafeNumber($("#baseline-amount-line2").value);
+  if ((d1 && !/^\d{4}\/\d{2}\/\d{2}$/.test(d1)) || (d2 && !/^\d{4}\/\d{2}\/\d{2}$/.test(d2))) {
+    showToast("فرمت تاریخ باید مثل 1405/05/24 باشد", "error");
+    return;
+  }
+  state.monthBaseline = {
+    line1: { date: d1, amount: isNaN(a1) ? 0 : a1 },
+    line2: { date: d2, amount: isNaN(a2) ? 0 : a2 },
+  };
+  await setSetting("monthBaseline", state.monthBaseline);
+  showToast("نقطه شروع تجمعی ماه ذخیره شد", "success");
+}
+
+async function handleClearBaseline() {
+  state.monthBaseline = { line1: { date: "", amount: 0 }, line2: { date: "", amount: 0 } };
+  await setSetting("monthBaseline", state.monthBaseline);
+  renderBaselineForm();
+  showToast("مبدأ تجمعی صفر شد — این ماه از صفر محاسبه می‌شود", "success");
+}
+
+/** Field definitions for the "colors" part of the report-appearance form —
+ * column widths, row heights and per-section fonts are built separately
+ * (see renderReportStyleForm) since they don't fit the flat key->color
+ * shape of these fields. */
+const REPORT_STYLE_COLOR_FIELDS = [
+  { key: "dateCellBg", label: "پس‌زمینه سلول تاریخ" },
+  { key: "dateCellText", label: "متن سلول تاریخ" },
+  { key: "titleCellBg", label: "پس‌زمینه عنوان گزارش" },
+  { key: "titleCellText", label: "متن عنوان گزارش" },
+  { key: "headerRowBg", label: "پس‌زمینه هدر ستون‌ها" },
+  { key: "headerRowText", label: "متن هدر ستون‌ها" },
+  { key: "dataRowBg", label: "پس‌زمینه ردیف‌های داده" },
+  { key: "dataRowText", label: "متن ردیف‌های داده" },
+  { key: "totalRowBg", label: "پس‌زمینه ردیف کل محصولات" },
+  { key: "totalRowText", label: "متن ردیف کل محصولات" },
+  { key: "remainingPositiveText", label: "متن «مانده» مثبت" },
+  { key: "remainingNegativeText", label: "متن «مانده» منفی" },
+  { key: "footerCustomerBg", label: "پس‌زمینه تعداد مشتری" },
+  { key: "footerCustomerText", label: "متن تعداد مشتری" },
+  { key: "footerPerRepBg", label: "پس‌زمینه سرانه مشتری" },
+  { key: "footerPerRepText", label: "متن سرانه مشتری" },
+  { key: "footerInvalidBg", label: "پس‌زمینه درصد ابطال" },
+  { key: "footerInvalidText", label: "متن درصد ابطال" },
+  { key: "borderColor", label: "رنگ خطوط جدول" },
+];
+const FONT_FAMILY_OPTIONS = [["Vazirmatn", "وزیرمتن"], ["Tahoma, sans-serif", "Tahoma"], ["'Segoe UI', sans-serif", "Segoe UI"]];
+const ROW_HEIGHT_LABELS = { title: "ارتفاع ردیف عنوان", header: "ارتفاع ردیف هدر", data: "ارتفاع ردیف‌های داده", total: "ارتفاع ردیف کل", footer: "ارتفاع ردیف پایین" };
+const FONT_SECTION_LABELS = [
+  { sizeKey: "titleSize", familyKey: "titleFontFamily", label: "عنوان اصلی" },
+  { sizeKey: "headerSize", familyKey: "headerFontFamily", label: "هدر ستون‌ها" },
+  { sizeKey: "bodySize", familyKey: "bodyFontFamily", label: "محتوای جدول" },
+  { sizeKey: "footerSize", familyKey: "footerFontFamily", label: "ردیف پایین" },
+];
+
+// Pending (not-yet-saved) reorder state for the two draggable lists in the
+// report-style form — mutated by drag/up-down, read by collectReportStyleFormValues.
+let pendingColumnOrder = null;
+let pendingFooterOrder = null;
+
+function renderReportStyleForm() {
+  const slot = $("#report-style-form-slot");
+  if (!slot) return;
+  const S = state.reportStyle;
+  pendingColumnOrder = [...S.columnOrder];
+  pendingFooterOrder = [...S.footerOrder];
+  slot.innerHTML = `
+    <div class="field-hint" style="margin-bottom:var(--space-3)">هر تغییری اینجا فقط روی همین دو تصویر گزارش کامل روز اثر می‌گذارد؛ برای دیدن نتیجه بدون ذخیره‌کردن، از «به‌روزرسانی پیش‌نمایش» استفاده کنید.</div>
+
+    <div class="report-image-wrap" id="style-preview-wrap" style="margin-bottom:var(--space-3);background:var(--color-surface-alt);border-radius:var(--radius-md);padding:var(--space-3)">
+      <span class="loading-row"><span class="spinner dark"></span> در حال ساخت پیش‌نمایش...</span>
+    </div>
+    <div class="row" style="margin-bottom:var(--space-5)">
+      <button type="button" class="btn btn-secondary btn-sm" id="btn-preview-report-style">${icon("image")} به‌روزرسانی پیش‌نمایش</button>
+    </div>
+
+    <div class="settings-subhead">عنوان و تاریخ</div>
+    <div class="form-grid">
+      <div class="field"><label>متن عنوان (${"{line}"} با «لاین یک/لاین دو» جایگزین می‌شود)</label>
+        <input type="text" class="style-input" data-style-key="titleTemplate" value="${escapeHtml(S.titleTemplate)}" /></div>
+      <div class="field"><label>متن تاریخ (${"{date}"} با تاریخ گزارش جایگزین می‌شود)</label>
+        <input type="text" class="style-input" data-style-key="dateTemplate" value="${escapeHtml(S.dateTemplate)}" /></div>
+    </div>
+
+    <div class="settings-subhead">فونت هر بخش</div>
+    <div class="form-grid">
+      ${FONT_SECTION_LABELS.map(
+        (f) => `
+        <div class="field">
+          <label>فونت ${escapeHtml(f.label)}</label>
+          <select class="style-input" data-style-key="${f.familyKey}">
+            ${FONT_FAMILY_OPTIONS.map(([v, l]) => `<option value="${escapeHtml(v)}" ${v === S[f.familyKey] ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>سایز ${escapeHtml(f.label)} (px)</label>
+          <input type="number" class="style-input" data-style-key="${f.sizeKey}" min="8" max="60" value="${S[f.sizeKey]}" />
+        </div>`
+      ).join("")}
+    </div>
+
+    <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب و عرض</div>
+    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره یا دکمه‌های بالا/پایین ترتیب نمایش (راست به چپ) را عوض کنید؛ برچسب هر ستون و عرض نسبی‌اش هم قابل ویرایش است.</div>
+    <div id="column-order-slot"></div>
+
+    <div class="settings-subhead">ردیف پایین (مشتری/سرانه/ابطالی) — ترتیب، برچسب و عرض</div>
+    <div id="footer-order-slot"></div>
+
+    <div class="settings-subhead">ارتفاع ردیف‌ها (px)</div>
+    <div class="form-grid">
+      ${Object.keys(ROW_HEIGHT_LABELS).map(
+        (k) => `
+        <div class="field">
+          <label>${escapeHtml(ROW_HEIGHT_LABELS[k])}</label>
+          <input type="number" class="style-input-rowh" data-row-key="${k}" min="16" max="120" value="${S.rowHeights[k]}" />
+        </div>`
+      ).join("")}
+    </div>
+
+    <div class="settings-subhead">رنگ‌ها</div>
+    <div class="form-grid">
+      ${REPORT_STYLE_COLOR_FIELDS.map(
+        (f) => `
+        <div class="field"><label>${escapeHtml(f.label)}</label>
+          <input type="color" class="style-input" data-style-key="${f.key}" value="${S[f.key]}" style="height:42px;padding:4px" /></div>`
+      ).join("")}
+    </div>`;
+
+  renderColumnOrderList();
+  renderFooterOrderList();
+  $("#btn-preview-report-style", slot).addEventListener("click", () => renderReportStylePreview(collectReportStyleFormValues()));
+  renderReportStylePreview(S); // initial preview using the saved style
+}
+
+/** Renders the draggable/reorderable list of the 5 table columns, each row
+ * carrying its own editable label text + relative width, inside
+ * #column-order-slot. Reordering only touches `pendingColumnOrder` (kept in
+ * sync with the form) — nothing is saved until «ذخیره ظاهر گزارش». */
+function renderColumnOrderList() {
+  const slot = $("#column-order-slot");
+  if (!slot) return;
+  const S = state.reportStyle;
+  slot.innerHTML = `<div class="order-list">${pendingColumnOrder
+    .map(
+      (key, idx) => `
+      <div class="order-item" draggable="true" data-col-key="${key}">
+        <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
+        <input type="text" class="style-input-collabel" data-col-key="${key}" value="${escapeHtml(S.columnLabels[key])}" style="flex:1;min-width:0" />
+        <input type="number" class="style-input-colw" data-col-key="${key}" min="1" value="${S.columnWeights[key]}" style="width:70px" title="عرض نسبی" />
+        <div class="move-btns">
+          <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="up" data-col-key="${key}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
+          <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="down" data-col-key="${key}" ${idx === pendingColumnOrder.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
+        </div>
+      </div>`
+    )
+    .join("")}</div>`;
+
+  $all("[data-col-move]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.colKey;
+      const idx = pendingColumnOrder.indexOf(key);
+      const swapIdx = btn.dataset.colMove === "up" ? idx - 1 : idx + 1;
+      if (idx < 0 || swapIdx < 0 || swapIdx >= pendingColumnOrder.length) return;
+      [pendingColumnOrder[idx], pendingColumnOrder[swapIdx]] = [pendingColumnOrder[swapIdx], pendingColumnOrder[idx]];
+      const draft = collectReportStyleFormValues();
+      renderColumnOrderList();
+      renderReportStylePreview(draft);
+    });
+  });
+  let dragKey = null;
+  $all(".order-item[draggable='true']", slot).forEach((item) => {
+    item.addEventListener("dragstart", () => { dragKey = item.dataset.colKey; item.classList.add("dragging"); });
+    item.addEventListener("dragend", () => item.classList.remove("dragging"));
+    item.addEventListener("dragover", (e) => e.preventDefault());
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const targetKey = item.dataset.colKey;
+      if (!dragKey || dragKey === targetKey) return;
+      const fromIdx = pendingColumnOrder.indexOf(dragKey);
+      const toIdx = pendingColumnOrder.indexOf(targetKey);
+      if (fromIdx < 0 || toIdx < 0) return;
+      const [moved] = pendingColumnOrder.splice(fromIdx, 1);
+      pendingColumnOrder.splice(toIdx, 0, moved);
+      const draft = collectReportStyleFormValues();
+      renderColumnOrderList();
+      renderReportStylePreview(draft);
+    });
+  });
+}
+
+/** Same idea as renderColumnOrderList but for the 3 footer stat cells
+ * (تعداد مشتری / سرانه / درصد ابطالی). */
+function renderFooterOrderList() {
+  const slot = $("#footer-order-slot");
+  if (!slot) return;
+  const S = state.reportStyle;
+  slot.innerHTML = `<div class="order-list">${pendingFooterOrder
+    .map(
+      (key, idx) => `
+      <div class="order-item" draggable="true" data-foot-key="${key}">
+        <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
+        <input type="text" class="style-input-footlabel" data-foot-key="${key}" value="${escapeHtml(S.footerLabels[key])}" style="flex:1;min-width:0" />
+        <input type="number" class="style-input-footw" data-foot-key="${key}" min="1" value="${S.footerWeights[key]}" style="width:70px" title="عرض نسبی" />
+        <div class="move-btns">
+          <button type="button" class="btn btn-icon btn-sm btn-secondary" data-foot-move="up" data-foot-key="${key}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
+          <button type="button" class="btn btn-icon btn-sm btn-secondary" data-foot-move="down" data-foot-key="${key}" ${idx === pendingFooterOrder.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
+        </div>
+      </div>`
+    )
+    .join("")}</div>`;
+
+  $all("[data-foot-move]", slot).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.footKey;
+      const idx = pendingFooterOrder.indexOf(key);
+      const swapIdx = btn.dataset.footMove === "up" ? idx - 1 : idx + 1;
+      if (idx < 0 || swapIdx < 0 || swapIdx >= pendingFooterOrder.length) return;
+      [pendingFooterOrder[idx], pendingFooterOrder[swapIdx]] = [pendingFooterOrder[swapIdx], pendingFooterOrder[idx]];
+      const draft = collectReportStyleFormValues();
+      renderFooterOrderList();
+      renderReportStylePreview(draft);
+    });
+  });
+  let dragKey = null;
+  $all(".order-item[draggable='true']", slot).forEach((item) => {
+    item.addEventListener("dragstart", () => { dragKey = item.dataset.footKey; item.classList.add("dragging"); });
+    item.addEventListener("dragend", () => item.classList.remove("dragging"));
+    item.addEventListener("dragover", (e) => e.preventDefault());
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const targetKey = item.dataset.footKey;
+      if (!dragKey || dragKey === targetKey) return;
+      const fromIdx = pendingFooterOrder.indexOf(dragKey);
+      const toIdx = pendingFooterOrder.indexOf(targetKey);
+      if (fromIdx < 0 || toIdx < 0) return;
+      const [moved] = pendingFooterOrder.splice(fromIdx, 1);
+      pendingFooterOrder.splice(toIdx, 0, moved);
+      const draft = collectReportStyleFormValues();
+      renderFooterOrderList();
+      renderReportStylePreview(draft);
+    });
+  });
+}
+
+/** Reads the current (unsaved) values out of the settings form and returns
+ * a full reportStyle object — used both by the live preview and by Save. */
+function collectReportStyleFormValues() {
+  const slot = $("#report-style-form-slot");
+  const s = { ...state.reportStyle };
+  $all(".style-input", slot).forEach((input) => {
+    const key = input.dataset.styleKey;
+    const isNumberField = key.endsWith("Size");
+    s[key] = isNumberField ? Number(input.value) || state.reportStyle[key] : input.value;
+  });
+
+  s.columnOrder = [...pendingColumnOrder];
+  const columnWeights = { ...state.reportStyle.columnWeights };
+  const columnLabels = { ...state.reportStyle.columnLabels };
+  $all(".style-input-colw", slot).forEach((input) => {
+    const v = Number(input.value);
+    if (v > 0) columnWeights[input.dataset.colKey] = v;
+  });
+  $all(".style-input-collabel", slot).forEach((input) => {
+    if (input.value.trim()) columnLabels[input.dataset.colKey] = input.value.trim();
+  });
+  s.columnWeights = columnWeights;
+  s.columnLabels = columnLabels;
+
+  s.footerOrder = [...pendingFooterOrder];
+  const footerWeights = { ...state.reportStyle.footerWeights };
+  const footerLabels = { ...state.reportStyle.footerLabels };
+  $all(".style-input-footw", slot).forEach((input) => {
+    const v = Number(input.value);
+    if (v > 0) footerWeights[input.dataset.footKey] = v;
+  });
+  $all(".style-input-footlabel", slot).forEach((input) => {
+    if (input.value.trim()) footerLabels[input.dataset.footKey] = input.value.trim();
+  });
+  s.footerWeights = footerWeights;
+  s.footerLabels = footerLabels;
+
+  const rowHeights = { ...state.reportStyle.rowHeights };
+  $all(".style-input-rowh", slot).forEach((input) => {
+    const k = input.dataset.rowKey;
+    const v = Number(input.value);
+    if (v > 0) rowHeights[k] = v;
+  });
+  s.rowHeights = rowHeights;
+  return s;
+}
+
+async function renderReportStylePreview(styleDraft) {
+  const wrap = $("#style-preview-wrap");
+  if (!wrap) return;
+  try {
+    const sampleData = lastFullReportContext?.results?.line1 || SAMPLE_PREVIEW_REPORT_DATA;
+    const canvas = await drawReportCanvas(sampleData, styleDraft);
+    wrap.innerHTML = `<img src="${canvas.toDataURL("image/png")}" alt="پیش‌نمایش گزارش" style="width:100%;border-radius:var(--radius-sm)" />`;
+  } catch (err) {
+    wrap.innerHTML = `<div class="alert alert-warning">${icon("alert-triangle")}<span>ساخت پیش‌نمایش با خطا مواجه شد</span></div>`;
+  }
+}
+
+async function handleSaveReportStyle() {
+  state.reportStyle = sanitizeReportStyle(collectReportStyleFormValues());
+  await setSetting("reportStyle", state.reportStyle);
+  showToast("ظاهر گزارش خروجی ذخیره شد", "success");
+}
+
+async function handleResetReportStyle() {
+  state.reportStyle = sanitizeReportStyle(DEFAULT_REPORT_STYLE);
+  await setSetting("reportStyle", state.reportStyle);
+  renderReportStyleForm();
+  showToast("ظاهر گزارش به حالت پیش‌فرض بازگشت", "success");
+}
+
+/* ---------------------------------------------------------
+   9b. پشتیبان‌گیری — export / import all groups, products, and settings
+   --------------------------------------------------------- */
+function handleExportBackup() {
+  const payload = {
+    app: "SalesFlow",
+    backupVersion: 1,
+    exportedAt: new Date().toISOString(),
+    groups: state.groups,
+    products: state.products,
+    columnMap: state.columnMap,
+    lines: state.lines,
+    lineGroups: state.lineGroups,
+    fontScale: state.fontScale,
+  };
+  const json = JSON.stringify(payload, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `salesflow-backup-${dateStr}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showToast("فایل پشتیبان دانلود شد", "success");
+}
+
+async function handleImportBackupFile(file) {
+  if (!file) return;
+  let payload;
+  try {
+    const text = await file.text();
+    payload = JSON.parse(text);
+  } catch (err) {
+    showToast("فایل پشتیبان معتبر نیست", "error");
+    return;
+  }
+  if (!payload || !Array.isArray(payload.groups) || !Array.isArray(payload.products)) {
+    showToast("ساختار فایل پشتیبان معتبر نیست", "error");
+    return;
+  }
+
+  const ok = await confirmModal({
+    icon: "alert-triangle",
+    title: "بازیابی فایل پشتیبان",
+    body: "با این کار تمام گروه‌های کالا، کدهای کالا و تنظیمات فعلی حذف و با اطلاعات فایل پشتیبان جایگزین می‌شوند. این عملیات قابل بازگشت نیست. آیا مطمئن هستید؟",
+    confirmLabel: "بازیابی و جایگزینی",
+    confirmClass: "btn-danger",
+  });
+  if (!ok) return;
+
+  try {
+    await Store.clear("groups");
+    await Store.clear("products");
+    await Store.clear("settings");
+
+    for (const g of payload.groups) await Store.put("groups", g);
+    for (const p of payload.products) await Store.put("products", p);
+    if (payload.columnMap) await setSetting("columnMap", payload.columnMap);
+    if (payload.lines) await setSetting("lines", payload.lines);
+    if (payload.lineGroups) await setSetting("lineGroups", payload.lineGroups);
+    if (payload.fontScale) await setSetting("fontScale", payload.fontScale);
+
+    await hydrateState();
+    document.documentElement.style.setProperty("--font-scale", String(state.fontScale));
+
+    renderGroupsList();
+    renderProductsList();
+    populateManualGroupSelect();
+    renderLineGroupCheckboxes();
+    loadSettingsFormFromState();
+    populateSingleReportSelectors();
+    handleRemoveSalesFile();
+
+    showToast("بازیابی با موفقیت انجام شد", "success");
+  } catch (err) {
+    showToast("خطا در بازیابی فایل پشتیبان", "error");
+  }
+}
+
+/* ---------------------------------------------------------
+   10. REPORT ENGINE
+   --------------------------------------------------------- */
+/**
+ * Many accounting/ERP systems (common with Iranian سیستم‌های حسابداری/فروش)
+ * export a ".xls"/".xlsx" file that is not actually a binary Excel file at
+ * all. Two variants show up in practice, and both silently produce an
+ * empty/garbled sheet (all-zero report) if handed straight to SheetJS's
+ * binary reader — it doesn't throw, so the failure is invisible:
+ *
+ *   1. An HTML table saved with an .xls extension.
+ *   2. Plain delimited text (tab- or comma-separated), frequently encoded
+ *      in a legacy Persian/Arabic codepage (Windows-1256) rather than
+ *      UTF-8, saved with an .xls extension.
+ *
+ * Opening either in Excel and using "Save As → xlsx" works because Excel
+ * itself converts the content into a real workbook first. This function
+ * detects a genuine binary workbook by its real file signature, and
+ * otherwise decodes the bytes as text (respecting a declared HTML
+ * <meta charset>, falling back through common encodings) to build a
+ * proper sheet directly — so the person never has to do that manual
+ * "open and re-save" step themselves.
+ */
+function readWorkbookSmart(buf) {
+  const sigBytes = new Uint8Array(buf.slice(0, 8));
+  const isZip = sigBytes[0] === 0x50 && sigBytes[1] === 0x4b; // "PK.." — real .xlsx
+  const isOle2 = sigBytes[0] === 0xd0 && sigBytes[1] === 0xcf && sigBytes[2] === 0x11 && sigBytes[3] === 0xe0; // real binary .xls
+  if (isZip || isOle2) {
+    return XLSX.read(buf, { type: "array" });
+  }
+
+  const headPeek = new TextDecoder("iso-8859-1").decode(buf.slice(0, 4000));
+  const looksLikeHtml = /<html[\s>]|<table[\s>]|<!doctype html/i.test(headPeek);
+  const charsetMatch = headPeek.match(/charset\s*=\s*["']?([\w-]+)/i);
+  const declaredEncoding = charsetMatch ? charsetMatch[1].toLowerCase() : null;
+  const candidates = [...new Set([declaredEncoding, "utf-8", "windows-1256", "windows-1252"].filter(Boolean))];
+
+  let text = null;
+  for (const enc of candidates) {
+    try {
+      const decoded = new TextDecoder(enc).decode(buf);
+      if (text === null) text = decoded; // keep the first successful decode as a fallback
+      if (!decoded.includes("\uFFFD")) { text = decoded; break; } // clean decode, no replacement chars
+    } catch (err) {
+      // unsupported encoding label — try the next candidate
+    }
+  }
+  if (text === null) text = new TextDecoder("utf-8").decode(buf);
+
+  if (looksLikeHtml) {
+    return XLSX.read(text, { type: "string" });
+  }
+
+  const delimitedWorkbook = buildWorkbookFromDelimitedText(text);
+  if (delimitedWorkbook) return delimitedWorkbook;
+
+  // Last resort — let the binary reader try anyway so a real error surfaces
+  // instead of the file being silently treated as empty.
+  return XLSX.read(buf, { type: "array" });
+}
+
+/**
+ * Builds a workbook from plain delimited text (tab, comma, or semicolon —
+ * whichever appears most on the first line). Used when a ".xls"/".xlsx"
+ * file turns out to be a flat text export rather than a real workbook.
+ */
+function buildWorkbookFromDelimitedText(text) {
+  const lines = text.split(/\r\n|\r|\n/).filter((line) => line.length > 0);
+  if (!lines.length) return null;
+
+  const sample = lines[0];
+  const delimiterCounts = {
+    "\t": (sample.match(/\t/g) || []).length,
+    ",": (sample.match(/,/g) || []).length,
+    ";": (sample.match(/;/g) || []).length,
+  };
+  const [bestDelimiter, bestCount] = Object.entries(delimiterCounts).sort((a, b) => b[1] - a[1])[0];
+  if (bestCount === 0) return null; // doesn't look like delimited data at all
+
+  const aoa = lines.map((line) => line.split(bestDelimiter));
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  return { SheetNames: ["Sheet1"], Sheets: { Sheet1: ws } };
+}
+
+function readWorkbookFromArrayBuffer(buf) {
+  return readWorkbookSmart(buf);
+}
+
+function getFirstSheetInfo(workbook) {
+  const sheetName = workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  if (!ws || !ws["!ref"]) return null;
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  const rows = XLSX.utils.sheet_to_json(ws, { header: "A", raw: true, defval: "" });
+  return { ws, range, rows: rows.slice(1) }; // skip header row
+}
+
+function validateColumnsExist(range, columnMap) {
+  const labels = { code: "کد کالا", qty: "تعداد فروش", carton: "تعداد در کارتن", line: "لاین", customer: "کد مشتری", invoice: "شماره پیش‌فاکتور" };
+  for (const key of Object.keys(columnMap)) {
+    const letter = columnMap[key];
+    if (!letter) return { ok: false, field: labels[key], letter };
+    const idx = XLSX.utils.decode_col(letter);
+    if (idx > range.e.c) return { ok: false, field: labels[key], letter };
+  }
+  return { ok: true };
+}
+
+/**
+ * Computes exact (unrounded) per-group sums, per-line totals, unique
+ * customer counts, and the set of undefined product codes encountered.
+ * Rounding is intentionally NOT applied here (section 22/38 of spec).
+ */
+/**
+ * Computes exact (unrounded) per-group sums, per-line totals, unique
+ * customer counts, and the set of undefined product codes encountered.
+ * Rounding is intentionally NOT applied here (section 22/38 of spec).
+ *
+ * Each group is tracked in TWO parallel sums:
+ *   - groupSumsDisplay: what a group's own report row shows — respects
+ *     "فروش به قوطی" (sellByUnit), so such a group's row is the raw sold
+ *     quantity (e.g. "بایودنت 1500 قوطی"), not divided by carton size.
+ *   - groupSumsCartonEquivalent: ALWAYS qty ÷ carton size, regardless of
+ *     sellByUnit. "مجموع" is built from this one only, so every group is
+ *     converted to the same carton unit before being added together —
+ *     otherwise a قوطی-based group's raw count would inflate the total.
+ *
+ * `groupsById` maps groupId -> group record, used to detect groups marked
+ * "غیرقابل فروش" (non-sellable, e.g. display stands) — rows for such
+ * products are excluded entirely: not in any group sum, not in the line
+ * total, and not counted toward unique customers either.
+ */
+function computeSalesReport(rows, columnMap, lines, productMap, groupsById) {
+  const result = {
+    line1: { groupSumsDisplay: {}, groupSumsCartonEquivalent: {}, customers: new Set() },
+    line2: { groupSumsDisplay: {}, groupSumsCartonEquivalent: {}, customers: new Set() },
+  };
+  const undefinedCodes = new Set();
+
+  for (const row of rows) {
+    // پیش‌فاکتور تسویه‌نشده (مقدار ستون برابر صفر) یعنی فاکتور نهایی نشده و
+    // اصلاً جزو فروش نیست — این سطر باید کاملاً از گزارش کنار گذاشته شود
+    // (نه در جمع گروه‌ها، نه در تعداد مشتری، نه در کدهای تعریف‌نشده).
+    const invoiceNum = toPersianSafeNumber(row[columnMap.invoice]);
+    if (invoiceNum === 0) continue;
+
+    const lineVal = normalizeStr(row[columnMap.line]);
+    let lineKey = null;
+    if (lineVal === lines.line1.excelValue) lineKey = "line1";
+    else if (lineVal === lines.line2.excelValue) lineKey = "line2";
+    if (!lineKey) continue; // other lines are ignored entirely
+
+    const code = normalizeStr(row[columnMap.code]);
+    const product = productMap.get(code);
+
+    // کالاهای گروه «غیرقابل فروش» (مثل استند) هرگز جزو فروش نیستند —
+    // نه در جمع گروه‌ها، نه در مجموع لاین، نه در تعداد مشتری.
+    if (product && groupsById.get(product.group)?.nonSellable) continue;
+
+    const customerVal = normalizeStr(row[columnMap.customer]);
+    if (customerVal) result[lineKey].customers.add(customerVal);
+
+    if (!product) {
+      if (code) undefinedCodes.add(code);
+      continue; // row not calculated further — no group is guessed
+    }
+
+    const qty = toPersianSafeNumber(row[columnMap.qty]);
+    const cartonFromFile = toPersianSafeNumber(row[columnMap.carton]);
+    let cartonQty = 0;
+    if (!isNaN(cartonFromFile) && cartonFromFile > 0) cartonQty = cartonFromFile;
+    else if (product.cartonQty > 0) cartonQty = product.cartonQty;
+
+    // carton-equivalent is always computed the same way, no matter the
+    // group's display setting — this is what "مجموع" is built from.
+    const cartonEquivalentSales = cartonQty > 0 && !isNaN(qty) ? qty / cartonQty : 0;
+
+    const productGroup = groupsById.get(product.group);
+    const displaySales = productGroup?.sellByUnit
+      ? (!isNaN(qty) ? qty : 0) // «فروش به قوطی» — نمایش با واحد خام
+      : cartonEquivalentSales;
+
+    const g = product.group;
+    result[lineKey].groupSumsDisplay[g] = (result[lineKey].groupSumsDisplay[g] || 0) + displaySales;
+    result[lineKey].groupSumsCartonEquivalent[g] = (result[lineKey].groupSumsCartonEquivalent[g] || 0) + cartonEquivalentSales;
+  }
+
+  return { ...result, undefinedCodes };
+}
+
+/**
+ * Builds report rows in the exact order the user configured for this line
+ * (section 8 UI — "تعریف گزارش کلی"), NOT the global group-management order.
+ *
+ * Each row's own value uses groupSumsDisplay (so a "فروش به قوطی" group
+ * shows its raw quantity). "مجموع" is built from groupSumsCartonEquivalent
+ * instead — every sellable group converted to the same carton unit — so it
+ * always reflects the line's true carton-equivalent sales, whether or not
+ * a group is included in the displayed rows, and without a قوطی-based
+ * group inflating it. Non-sellable ("غیرقابل فروش") groups never enter
+ * either sum to begin with (computeSalesReport already excludes them).
+ * "مجموع" is always rendered as the final row by the caller.
+ */
+function buildLineReportRows(groupSumsDisplay, groupSumsCartonEquivalent, selectedGroupIds) {
+  const rows = selectedGroupIds
+    .map((gid) => groupById(gid))
+    .filter(Boolean)
+    .map((g) => {
+      const exact = groupSumsDisplay[g.id] || 0;
+      return { groupId: g.id, name: g.name, exact, rounded: Math.round(exact), sellByUnit: !!g.sellByUnit };
+    });
+  const totalExact = Object.values(groupSumsCartonEquivalent).reduce((sum, v) => sum + v, 0);
+  const totalRounded = Math.round(totalExact);
+  return { rows, totalExact, totalRounded };
+}
+
+/* ---------------------------------------------------------
+   11. REPORTS VIEW — file loading + گزارش کلی + گزارش تکی
+   --------------------------------------------------------- */
+let currentSalesRows = null; // cached parsed rows of the currently selected sales file
+let lastUndefinedCodes = [];
+let lastReportData = null;        // most recently generated {line1, line2} report (SalesFlow نسخه ۲)
+let lastFullReportContext = null; // computed data behind the currently-shown full-report images
+let fontDataUrlCache = {};        // cache of local woff2 fonts -> base64 data URLs, for image export
+
+async function handleSalesFileSelected(file) {
+  const statusEl = $("#sales-file-status");
+  const dropEl = $("#sales-file-drop");
+  const removeBtn = $("#btn-remove-sales-file");
+  statusEl.textContent = "";
+  dropEl.classList.remove("has-file");
+  removeBtn.style.display = "none";
+  currentSalesRows = null;
+  $("#btn-generate-report").disabled = true;
+  $("#sales-file-warning-slot").innerHTML = "";
+  if (!file) return;
+
+  try {
+    const buf = await file.arrayBuffer();
+    const workbook = readWorkbookFromArrayBuffer(buf);
+    const info = getFirstSheetInfo(workbook);
+    if (!info) {
+      showToast("فایل معتبر نیست", "error");
+      return;
+    }
+    currentSalesRows = info;
+    statusEl.textContent = "فایل انتخاب شد";
+    dropEl.classList.add("has-file");
+    removeBtn.style.display = "inline-flex";
+    $("#btn-generate-report").disabled = false;
+  } catch (err) {
+    showToast("خطا در خواندن فایل", "error");
+  }
+}
+
+function handleRemoveSalesFile() {
+  currentSalesRows = null;
+  lastUndefinedCodes = [];
+  lastReportData = null;
+  lastFullReportContext = null;
+  $("#sales-file-input").value = "";
+  $("#sales-file-status").textContent = "";
+  $("#sales-file-drop").classList.remove("has-file");
+  $("#btn-remove-sales-file").style.display = "none";
+  $("#btn-generate-report").disabled = true;
+  $("#sales-file-warning-slot").innerHTML = "";
+  $("#undefined-codes-alert-slot").innerHTML = "";
+  $("#report-output").innerHTML = `
+    <div class="empty-state">
+      <div class="icon">📄</div>
+      <div class="title">هنوز گزارشی تولید نشده است</div>
+      <div>فایل فروش را انتخاب کرده و روی «تولید گزارش» کلیک کنید</div>
+    </div>`;
+  $("#full-report-trigger-row").style.display = "none";
+  $("#full-report-card").style.display = "none";
+  $("#full-report-output").innerHTML = "";
+  showToast("فایل حذف شد — می‌توانید فایل جدید انتخاب کنید", "success");
+}
+
+function showColumnValidationError(field) {
+  $("#sales-file-warning-slot").innerHTML = `
+    <div class="alert alert-warning">
+      <span class="icon"><svg><use href="#icon-alert-triangle"></use></svg></span>
+      <span>خطا در فایل فروش — ستون «${escapeHtml(field)}» که در تنظیمات مشخص شده، در فایل واردشده وجود ندارد. لطفاً فایل یا تنظیمات ستون‌ها را بررسی کنید.</span>
+    </div>`;
+}
+
+async function handleGenerateReport() {
+  if (!currentSalesRows) {
+    showToast("لطفاً ابتدا فایل فروش را انتخاب کنید", "error");
+    return;
+  }
+  $("#sales-file-warning-slot").innerHTML = "";
+  $("#undefined-codes-alert-slot").innerHTML = "";
+
+  const valid = validateColumnsExist(currentSalesRows.range, state.columnMap);
+  if (!valid.ok) { showColumnValidationError(valid.field); return; }
+  if (!state.lines.line1.excelValue || !state.lines.line2.excelValue) {
+    showToast("ابتدا مقدار دقیق لاین‌ها را در تنظیمات وارد کنید", "error");
+    return;
+  }
+  if (!state.groups.length) {
+    showToast("ابتدا گروه‌های کالا را در بخش مدیریت تعریف کنید", "error");
+    return;
+  }
+
+  $("#report-loading").style.display = "flex";
+  $("#report-output").innerHTML = "";
+  await new Promise((r) => setTimeout(r, 30)); // let loading paint before heavy sync work
+
+  const productMap = new Map(state.products.map((p) => [p.code, p]));
+  const groupsById = new Map(state.groups.map((g) => [g.id, g]));
+  const { line1, line2, undefinedCodes } = computeSalesReport(
+    currentSalesRows.rows, state.columnMap, state.lines, productMap, groupsById
+  );
+
+  const r1 = buildLineReportRows(line1.groupSumsDisplay, line1.groupSumsCartonEquivalent, state.lineGroups.line1);
+  const r2 = buildLineReportRows(line2.groupSumsDisplay, line2.groupSumsCartonEquivalent, state.lineGroups.line2);
+
+  $("#report-loading").style.display = "none";
+  lastReportData = {
+    line1: { ...r1, customerCount: line1.customers.size },
+    line2: { ...r2, customerCount: line2.customers.size },
+  };
+  renderFullReport(lastReportData);
+  $("#full-report-trigger-row").style.display = "flex";
+  $("#full-report-card").style.display = "none";
+  $("#full-report-output").innerHTML = "";
+
+  lastUndefinedCodes = Array.from(undefinedCodes);
+  if (lastUndefinedCodes.length) {
+    $("#undefined-codes-alert-slot").innerHTML = `
+      <div class="alert alert-warning">
+        <span class="icon"><svg><use href="#icon-alert-triangle"></use></svg></span>
+        <span>${lastUndefinedCodes.length.toLocaleString("fa-IR")} کد کالا تعریف نشده‌اند —
+          <button class="link" id="btn-show-undefined-codes">نمایش لیست</button>
+        </span>
+      </div>`;
+    $("#btn-show-undefined-codes").addEventListener("click", () => {
+      openModal({
+        icon: "alert-triangle",
+        title: "کدهای کالای تعریف‌نشده",
+        body: "این کدها در بانک کالا ثبت نشده‌اند و در محاسبه گزارش لحاظ نشده‌اند:",
+        listItems: lastUndefinedCodes,
+        actions: [{ label: "باشه", className: "btn-primary" }],
+      });
+    });
+  }
+}
+
+function renderLineReportCard(lineKey, lineLabel, dotClass, data) {
+  const rowsHtml = data.rows.length
+    ? data.rows
+        .map((r) => {
+          const displayValue = r.sellByUnit ? `${formatNumber(r.rounded)} قوطی` : formatNumber(r.rounded);
+          return `<tr class="${r.rounded === 0 ? "table-row-zero" : ""}"><td>${escapeHtml(r.name)}</td><td class="num">${displayValue}</td></tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="2" style="text-align:center;color:var(--color-text-faint)">هیچ گروهی برای نمایش در این لاین تعریف نشده است</td></tr>`;
+
+  return `
+    <div class="line-block">
+      <div class="line-block-header">
+        <div class="line-block-title"><span class="line-dot ${dotClass}"></span> ${lineLabel}</div>
+        <span class="customer-count">تعداد مشتری: ${data.customerCount.toLocaleString("fa-IR")}</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>گروه کالا</th><th class="num">فروش</th></tr></thead>
+          <tbody>
+            ${rowsHtml}
+            <tr class="table-row-total"><td>مجموع</td><td class="num">${formatNumber(data.totalRounded)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <button class="btn btn-secondary btn-sm" data-copy-line="${lineKey}"><svg width="15" height="15"><use href="#icon-copy"></use></svg> کپی گزارش ${lineLabel}</button>
+    </div>`;
+}
+
+function renderFullReport(data) {
+  const out = $("#report-output");
+  out.innerHTML = `
+    <div class="stack" style="gap:var(--space-6)">
+      ${renderLineReportCard("line1", "لاین یک", "line1", data.line1)}
+      <div class="divider"></div>
+      ${renderLineReportCard("line2", "لاین دو", "line2", data.line2)}
+    </div>`;
+  out.dataset.hasReport = "1";
+
+  $all("[data-copy-line]", out).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.copyLine;
+      const d = data[key];
+      const lines = [...d.rows.map((r) => String(r.rounded)), String(d.totalRounded)];
+      copyToClipboard(lines.join("\n"));
+    });
+  });
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("در کلیپ‌بورد کپی شد", "success");
+  } catch (err) {
+    // fallback
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); showToast("در کلیپ‌بورد کپی شد", "success"); }
+    catch { showToast("کپی با خطا مواجه شد", "error"); }
+    ta.remove();
+  }
+}
+
+/* ---------------------------------------------------------
+   11b. گزارش کامل روز — SalesFlow نسخه ۲
+   تاریخ + درصد ابطالی → محاسبه هدف/تجمعی/مانده/سرانه → دو تصویر
+   --------------------------------------------------------- */
+function openFullReportModal() {
+  if (!lastReportData) {
+    showToast("ابتدا گزارش را تولید کنید", "error");
+    return;
+  }
+  const [jy, jm, jd] = todayJalali();
+  const region = $("#modal-region");
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:480px">
+      <div class="modal-title">گزارش کامل روز</div>
+      <div class="modal-body">تاریخ گزارش (قابل‌ویرایش) و درصد ابطالی هر لاین را مشخص کنید — درصد ابطالی اختیاری است.</div>
+      <div class="form-grid" style="margin-top:var(--space-4)">
+        <div class="field" style="grid-column:1/-1">
+          <label>${icon("calendar")} تاریخ گزارش (شمسی)</label>
+          <div class="row">
+            <input type="number" id="fr-date-y" value="${jy}" style="width:90px" placeholder="سال" />
+            <input type="number" id="fr-date-m" min="1" max="12" value="${jm}" style="width:70px" placeholder="ماه" />
+            <input type="number" id="fr-date-d" min="1" max="31" value="${jd}" style="width:70px" placeholder="روز" />
+          </div>
+        </div>
+        <div class="field">
+          <label><span class="line-dot line1"></span> درصد ابطالی لاین یک</label>
+          <input type="text" id="fr-invalid-line1" placeholder="اختیاری — می‌توانید خالی بگذارید" />
+        </div>
+        <div class="field">
+          <label><span class="line-dot line2"></span> درصد ابطالی لاین دو</label>
+          <input type="text" id="fr-invalid-line2" placeholder="اختیاری — می‌توانید خالی بگذارید" />
+        </div>
+      </div>
+      <div class="modal-actions" id="fr-modal-actions" style="margin-top:var(--space-5)"></div>
+    </div>`;
+  region.appendChild(overlay);
+  const actionsSlot = $("#fr-modal-actions", overlay);
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn-secondary";
+  cancelBtn.textContent = "انصراف";
+  cancelBtn.onclick = () => overlay.remove();
+  const confirmBtn = document.createElement("button");
+  confirmBtn.className = "btn btn-primary";
+  confirmBtn.textContent = "تایید و نمایش تصاویر";
+  confirmBtn.onclick = async () => {
+    const y = Number($("#fr-date-y", overlay).value);
+    const m = Number($("#fr-date-m", overlay).value);
+    const d = Number($("#fr-date-d", overlay).value);
+    if (!y || !m || m < 1 || m > 12 || !d || d < 1 || d > 31) {
+      showToast("تاریخ نامعتبر است", "error");
+      return;
+    }
+    const dateStr = jalaliToStr(y, m, d);
+    const invalidPct = {
+      line1: normalizeStr($("#fr-invalid-line1", overlay).value),
+      line2: normalizeStr($("#fr-invalid-line2", overlay).value),
+    };
+    overlay.remove();
+    await generateFullReport(dateStr, invalidPct);
+  };
+  actionsSlot.appendChild(cancelBtn);
+  actionsSlot.appendChild(confirmBtn);
+}
+
+async function generateFullReport(dateStr, invalidPct) {
+  const results = {};
+  for (const lineKey of ["line1", "line2"]) {
+    const rd = lastReportData[lineKey];
+    const targets = state.monthlyTargets[lineKey] || {};
+    const cum = await getMonthCumulativeRows(lineKey, dateStr); // excludes today (not yet saved)
+    const rows = rd.rows.map((r) => {
+      const cumulative = (cum.byGroup[r.groupId] || 0) + r.rounded;
+      const target = targets[r.groupId] != null ? targets[r.groupId] : null;
+      return {
+        groupId: r.groupId,
+        name: r.name,
+        sellByUnit: r.sellByUnit,
+        todaySale: r.rounded,
+        target,
+        cumulative,
+        remaining: target != null ? cumulative - target : null,
+      };
+    });
+    const totalToday = rd.totalRounded;
+    const totalCumulative = cum.total + totalToday;
+    const targetTotal = state.targetTotals[lineKey] || 0;
+    const sellers = state.sellersCount[lineKey] || 0;
+    const perRep = sellers > 0 ? rd.customerCount / sellers : null;
+    results[lineKey] = {
+      lineLabel: lineKey === "line1" ? "لاین یک" : "لاین دو",
+      dateStr,
+      rows,
+      totalToday,
+      totalCumulative,
+      targetTotal,
+      totalRemaining: totalCumulative - targetTotal,
+      customerCount: rd.customerCount,
+      perRep,
+      invalidPct: invalidPct[lineKey] || "",
+    };
+  }
+  lastFullReportContext = { dateStr, results };
+  $("#full-report-card").style.display = "block";
+  await renderFullReportImages(results);
+  $("#full-report-card").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/** Waits for the Vazirmatn weights we draw with to be fully loaded, so the
+ * canvas text below is rendered with the correct glyphs on first paint. */
+async function ensureReportFontsLoaded(sizes) {
+  const jobs = [];
+  for (const s of sizes) {
+    jobs.push(document.fonts.load(`400 ${s}px Vazirmatn`));
+    jobs.push(document.fonts.load(`700 ${s}px Vazirmatn`));
+  }
+  await Promise.all(jobs);
+  await document.fonts.ready;
+}
+
+/** Given column-width weights (relative, any positive numbers) in visual
+ * right-to-left order (first = rightmost, matching how the report reads in
+ * RTL), returns each column's {x0,x1,w} pixel bounds within a canvas of
+ * `canvasWidth`. Weights are normalized automatically so they don't need
+ * to add up to any particular total. */
+function computeColumnBoundsRTL(weights, canvasWidth) {
+  const total = weights.reduce((s, w) => s + (w > 0 ? w : 0), 0) || 1;
+  let xRight = canvasWidth;
+  return weights.map((w) => {
+    const width = (Math.max(w, 0) / total) * canvasWidth;
+    const b = { x0: xRight - width, x1: xRight, w: width };
+    xRight -= width;
+    return b;
+  });
+}
+
+/** Draws one line's full-day report (title+date, column headers, one row
+ * per product group, total row, footer stats row) directly with the
+ * Canvas 2D API — column widths, row heights, per-section fonts/sizes and
+ * every color come from `S` (state.reportStyle, or a live-preview draft of
+ * it) — and returns the finished <canvas>. Pure vector drawing avoids the
+ * "tainted canvas" restriction that an SVG/foreignObject round-trip runs
+ * into. */
+async function drawReportCanvas(data, S) {
+  const scale = 2; // export at 2x for crisp screenshots
+  const widthCss = 660;
+  const rowH = S.rowHeights;
+  const padTop = 6, padBottom = 6;
+  const heightCss = padTop + rowH.title + rowH.header + data.rows.length * rowH.data + rowH.total + rowH.footer + padBottom;
+
+  await ensureReportFontsLoaded([S.titleSize, S.headerSize, S.bodySize, S.footerSize, Math.round(S.titleSize * 0.7)]);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(widthCss * scale);
+  canvas.height = Math.round(heightCss * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(scale, scale);
+  ctx.direction = "rtl";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, widthCss, heightCss);
+
+  // column bounds follow S.columnOrder (right-to-left) + S.columnWeights, keyed by column id
+  const bounds = computeColumnBoundsRTL(S.columnOrder.map((k) => S.columnWeights[k]), widthCss);
+  const colBoundsByKey = {};
+  S.columnOrder.forEach((k, i) => (colBoundsByKey[k] = bounds[i]));
+  // footer bounds are a separate 3-slot row, following S.footerOrder + S.footerWeights
+  const footerBounds = computeColumnBoundsRTL(S.footerOrder.map((k) => S.footerWeights[k]), widthCss);
+  const footerBoundsByKey = {};
+  S.footerOrder.forEach((k, i) => (footerBoundsByKey[k] = footerBounds[i]));
+
+  const fmt = (n) => toPersianDigits(formatNumber(n));
+
+  function cell(x0, x1, y0, y1, bg) {
+    ctx.fillStyle = bg;
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.strokeStyle = S.borderColor;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0 - 1, y1 - y0 - 1);
+  }
+  function text(str, cx, cy, size, color, weight, family, dir, maxWidth) {
+    ctx.fillStyle = color;
+    ctx.font = `${weight} ${size}px ${family}, Tahoma, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.direction = dir || "rtl";
+    ctx.fillText(String(str), cx, cy, maxWidth);
+    ctx.direction = "rtl";
+  }
+
+  let y = padTop;
+
+  // ---- title row: rightmost 3 column-slots = report title, leftmost 2 = date ----
+  const titleX0 = bounds[2].x0, titleX1 = bounds[0].x1;
+  const dateX0 = bounds[4].x0, dateX1 = bounds[3].x1;
+  cell(titleX0, titleX1, y, y + rowH.title, S.titleCellBg);
+  cell(dateX0, dateX1, y, y + rowH.title, S.dateCellBg);
+  text(S.titleTemplate.replace("{line}", data.lineLabel), (titleX0 + titleX1) / 2, y + rowH.title / 2, S.titleSize, S.titleCellText, "700", S.titleFontFamily, "rtl", (titleX1 - titleX0) * 0.94);
+  text(S.dateTemplate.replace("{date}", toPersianDigits(data.dateStr)), (dateX0 + dateX1) / 2, y + rowH.title / 2, Math.round(S.titleSize * 0.7), S.dateCellText, "700", S.titleFontFamily, "rtl", (dateX1 - dateX0) * 0.94);
+  y += rowH.title;
+
+  // ---- column header row ----
+  S.columnOrder.forEach((key) => {
+    const b = colBoundsByKey[key];
+    cell(b.x0, b.x1, y, y + rowH.header, S.headerRowBg);
+    text(S.columnLabels[key], (b.x0 + b.x1) / 2, y + rowH.header / 2, S.headerSize, S.headerRowText, "700", S.headerFontFamily, "rtl", b.w * 0.92);
+  });
+  y += rowH.header;
+
+  // ---- one data row per product group ----
+  for (const r of data.rows) {
+    const todayDisplay = r.sellByUnit ? `${fmt(r.todaySale)} قوطی` : fmt(r.todaySale);
+    const valuesByKey = {
+      product: r.name,
+      target: r.target != null ? fmt(r.target) : "—",
+      today: todayDisplay,
+      cumulative: fmt(r.cumulative),
+      remaining: r.remaining != null ? fmt(r.remaining) : "—",
+    };
+    S.columnOrder.forEach((key) => {
+      const b = colBoundsByKey[key];
+      cell(b.x0, b.x1, y, y + rowH.data, S.dataRowBg);
+      const color = key === "remaining" ? (r.remaining == null ? S.dataRowText : r.remaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.dataRowText;
+      text(valuesByKey[key], (b.x0 + b.x1) / 2, y + rowH.data / 2, S.bodySize, color, key === "product" ? "700" : "400", S.bodyFontFamily, key === "product" ? "rtl" : "ltr", b.w * 0.92);
+    });
+    y += rowH.data;
+  }
+
+  // ---- total row ----
+  {
+    const valuesByKey = {
+      product: "کل محصولات",
+      target: fmt(data.targetTotal),
+      today: fmt(data.totalToday),
+      cumulative: fmt(data.totalCumulative),
+      remaining: fmt(data.totalRemaining),
+    };
+    S.columnOrder.forEach((key) => {
+      const b = colBoundsByKey[key];
+      cell(b.x0, b.x1, y, y + rowH.total, S.totalRowBg);
+      const color = key === "remaining" ? (data.totalRemaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.totalRowText;
+      text(valuesByKey[key], (b.x0 + b.x1) / 2, y + rowH.total / 2, S.bodySize, color, "700", S.bodyFontFamily, key === "product" ? "rtl" : "ltr", b.w * 0.92);
+    });
+    y += rowH.total;
+  }
+
+  // ---- footer stats row — order/labels/widths from S.footerOrder ----
+  {
+    const invalidDisplay = data.invalidPct ? `${toPersianDigits(data.invalidPct)}٪` : "—";
+    const perRepDisplay = data.perRep != null ? toPersianDigits(data.perRep.toFixed(1)) : "—";
+    const valuesByKey = { customer: toPersianDigits(data.customerCount), perRep: perRepDisplay, invalid: invalidDisplay };
+    const bgByKey = { customer: S.footerCustomerBg, perRep: S.footerPerRepBg, invalid: S.footerInvalidBg };
+    const textColorByKey = { customer: S.footerCustomerText, perRep: S.footerPerRepText, invalid: S.footerInvalidText };
+    S.footerOrder.forEach((key) => {
+      const b = footerBoundsByKey[key];
+      cell(b.x0, b.x1, y, y + rowH.footer, bgByKey[key]);
+      const label = `${S.footerLabels[key]}: ${valuesByKey[key]}`;
+      text(label, (b.x0 + b.x1) / 2, y + rowH.footer / 2, key === "perRep" ? Math.max(11, S.footerSize - 2) : S.footerSize, textColorByKey[key], "700", S.footerFontFamily, "rtl", b.w * 0.92);
+    });
+  }
+
+  return canvas;
+}
+
+async function renderReportToPngDataUrl(data) {
+  const canvas = await drawReportCanvas(data, state.reportStyle);
+  return canvas.toDataURL("image/png");
+}
+
+function dataUrlToBlob(dataUrl) {
+  const [meta, b64] = dataUrl.split(",");
+  const mime = meta.match(/:(.*?);/)[1];
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+async function renderFullReportImages(results) {
+  const out = $("#full-report-output");
+  out.innerHTML = `
+    <div class="stack" style="gap:var(--space-6)">
+      <div>
+        <div class="line-block-title" style="margin-bottom:var(--space-3)"><span class="line-dot line1"></span> گزارش لاین یک:</div>
+        <div class="report-image-wrap" id="fr-image-wrap-line1"><span class="loading-row"><span class="spinner dark"></span> در حال ساخت تصویر...</span></div>
+        <div class="report-image-actions" id="fr-actions-line1" style="display:none">
+          <button class="btn btn-secondary btn-sm" data-fr-action="copy" data-fr-line="line1">${icon("copy")} کپی</button>
+          <button class="btn btn-secondary btn-sm" data-fr-action="download" data-fr-line="line1">${icon("download")} دریافت تصویر</button>
+          <button class="btn btn-secondary btn-sm" data-fr-action="share" data-fr-line="line1">${icon("share")} اشتراک‌گذاری</button>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div>
+        <div class="line-block-title" style="margin-bottom:var(--space-3)"><span class="line-dot line2"></span> گزارش لاین دو:</div>
+        <div class="report-image-wrap" id="fr-image-wrap-line2"><span class="loading-row"><span class="spinner dark"></span> در حال ساخت تصویر...</span></div>
+        <div class="report-image-actions" id="fr-actions-line2" style="display:none">
+          <button class="btn btn-secondary btn-sm" data-fr-action="copy" data-fr-line="line2">${icon("copy")} کپی</button>
+          <button class="btn btn-secondary btn-sm" data-fr-action="download" data-fr-line="line2">${icon("download")} دریافت تصویر</button>
+          <button class="btn btn-secondary btn-sm" data-fr-action="share" data-fr-line="line2">${icon("share")} اشتراک‌گذاری</button>
+        </div>
+      </div>
+    </div>`;
+
+  for (const lineKey of ["line1", "line2"]) {
+    try {
+      const dataUrl = await renderReportToPngDataUrl(results[lineKey]);
+      lastFullReportContext.results[lineKey].imageDataUrl = dataUrl;
+      const wrap = $(`#fr-image-wrap-${lineKey}`);
+      wrap.innerHTML = `<img src="${dataUrl}" alt="گزارش ${results[lineKey].lineLabel}" style="width:100%;border-radius:var(--radius-md);border:1px solid var(--color-border);cursor:pointer" data-fr-image="${lineKey}" />`;
+      $(`#fr-actions-${lineKey}`).style.display = "flex";
+      $(`[data-fr-image="${lineKey}"]`, wrap).addEventListener("click", () => copyReportImage(lineKey));
+    } catch (err) {
+      $(`#fr-image-wrap-${lineKey}`).innerHTML = `<div class="alert alert-warning">${icon("alert-triangle")}<span>ساخت تصویر با خطا مواجه شد</span></div>`;
+    }
+  }
+
+  $all("[data-fr-action]", out).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const lineKey = btn.dataset.frLine;
+      const action = btn.dataset.frAction;
+      if (action === "copy") copyReportImage(lineKey);
+      else if (action === "download") downloadReportImage(lineKey);
+      else if (action === "share") shareReportImage(lineKey);
+    });
+  });
+}
+
+async function copyReportImage(lineKey) {
+  const dataUrl = lastFullReportContext?.results?.[lineKey]?.imageDataUrl;
+  if (!dataUrl) return;
+  try {
+    const blob = dataUrlToBlob(dataUrl);
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    showToast("تصویر گزارش کپی شد — آماده ارسال", "success");
+  } catch (err) {
+    showToast("کپی تصویر پشتیبانی نشد — از «دریافت تصویر» استفاده کنید", "warning");
+  }
+}
+
+function downloadReportImage(lineKey) {
+  const ctx = lastFullReportContext;
+  const dataUrl = ctx?.results?.[lineKey]?.imageDataUrl;
+  if (!dataUrl) return;
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = `salesflow-${lineKey === "line1" ? "line1" : "line2"}-${ctx.dateStr.replace(/\//g, "-")}.png`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function shareReportImage(lineKey) {
+  const ctx = lastFullReportContext;
+  const data = ctx?.results?.[lineKey];
+  if (!data?.imageDataUrl) return;
+  const blob = dataUrlToBlob(data.imageDataUrl);
+  const file = new File([blob], `salesflow-${lineKey}-${ctx.dateStr.replace(/\//g, "-")}.png`, { type: "image/png" });
+  if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: `گزارش ${data.lineLabel}` });
+    } catch (err) {
+      // user cancelled the share sheet — no action needed
+    }
+  } else {
+    showToast("اشتراک‌گذاری مستقیم پشتیبانی نمی‌شود — تصویر دانلود شد", "warning");
+    downloadReportImage(lineKey);
+  }
+}
+
+async function handleSaveDailySale() {
+  if (!lastFullReportContext) {
+    showToast("ابتدا گزارش کامل روز را نمایش دهید", "error");
+    return;
+  }
+  const { dateStr, results } = lastFullReportContext;
+  for (const lineKey of ["line1", "line2"]) {
+    const rd = results[lineKey];
+    await saveDailySaleFull(dateStr, lineKey, rd.rows, rd.totalToday);
+  }
+  showToast(`فروش روز ${toPersianDigits(dateStr)} در مخزن فروش ذخیره شد`, "success");
+}
+
+/* ----- گزارش تکی ----- */
+function populateSingleReportSelectors() {
+  const lineSel = $("#single-line-select");
+  const groupSel = $("#single-group-select");
+  if (!lineSel || !groupSel) return;
+  lineSel.innerHTML = `<option value="line1">لاین یک</option><option value="line2">لاین دو</option>`;
+  const sorted = [...state.groups].filter((g) => !g.nonSellable).sort((a, b) => a.order - b.order);
+  groupSel.innerHTML = sorted.length
+    ? sorted.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join("")
+    : `<option value="">— گروهی تعریف نشده —</option>`;
+}
+
+function handleSingleReport() {
+  const out = $("#single-report-output");
+  out.innerHTML = "";
+  if (!currentSalesRows) {
+    showToast("لطفاً ابتدا فایل فروش را در بخش «گزارش کلی» انتخاب کنید", "error");
+    return;
+  }
+  const valid = validateColumnsExist(currentSalesRows.range, state.columnMap);
+  if (!valid.ok) { showColumnValidationError(valid.field); return; }
+  if (!state.lines.line1.excelValue || !state.lines.line2.excelValue) {
+    showToast("ابتدا مقدار دقیق لاین‌ها را در تنظیمات وارد کنید", "error");
+    return;
+  }
+  const lineKey = $("#single-line-select").value;
+  const groupId = Number($("#single-group-select").value);
+  const group = groupById(groupId);
+  if (!group) {
+    showToast("ابتدا حداقل یک گروه کالا تعریف کنید", "error");
+    return;
+  }
+
+  const productMap = new Map(state.products.map((p) => [p.code, p]));
+  const groupsById = new Map(state.groups.map((g) => [g.id, g]));
+  const { line1, line2 } = computeSalesReport(currentSalesRows.rows, state.columnMap, state.lines, productMap, groupsById);
+  const target = lineKey === "line1" ? line1 : line2;
+  const exact = target.groupSumsDisplay[groupId] || 0;
+  const rounded = Math.round(exact);
+  const displayValue = group.sellByUnit ? `${formatNumber(rounded)} قوطی` : formatNumber(rounded);
+
+  out.innerHTML = `
+    <div class="card" style="background:var(--color-surface-alt)">
+      <div class="row-between">
+        <span>لاین: <strong>${lineKey === "line1" ? "لاین یک" : "لاین دو"}</strong></span>
+        <span>گروه: <strong>${escapeHtml(group.name)}</strong></span>
+        <span>تعداد فروش: <strong class="num">${displayValue}</strong></span>
+      </div>
+    </div>`;
+}
+
+/* ---------------------------------------------------------
+   12. Wiring — event bindings & init
+   --------------------------------------------------------- */
+function bindNavigation() {
+  $all(".nav-item").forEach((btn) => {
+    btn.addEventListener("click", () => switchView(btn.dataset.view));
+  });
+  $all("#management-tabs .tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => switchManagementTab(btn.dataset.mtab));
+  });
+}
+
+/** Wires native HTML5 drag-and-drop onto a drop-zone element, in addition
+ * to its existing click-to-browse button, calling onFile(file) either way. */
+function enableFileDragDrop(dropEl, onFile) {
+  ["dragenter", "dragover"].forEach((evt) => {
+    dropEl.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropEl.classList.add("drag-active");
+    });
+  });
+  ["dragleave", "dragend"].forEach((evt) => {
+    dropEl.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropEl.classList.remove("drag-active");
+    });
+  });
+  dropEl.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropEl.classList.remove("drag-active");
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) onFile(file);
+  });
+}
+
+function bindReportsView() {
+  $("#btn-pick-sales-file").addEventListener("click", () => $("#sales-file-input").click());
+  $("#sales-file-input").addEventListener("change", (e) => handleSalesFileSelected(e.target.files[0]));
+  $("#btn-remove-sales-file").addEventListener("click", handleRemoveSalesFile);
+  $("#btn-generate-report").addEventListener("click", handleGenerateReport);
+  $("#btn-single-report").addEventListener("click", handleSingleReport);
+  enableFileDragDrop($("#sales-file-drop"), handleSalesFileSelected);
+
+  $("#btn-open-full-report").addEventListener("click", openFullReportModal);
+  $("#btn-save-daily-sale").addEventListener("click", handleSaveDailySale);
+}
+
+function bindManagementView() {
+  $("#btn-add-group").addEventListener("click", () => toggleGroupAddRow(true));
+  document.addEventListener("click", (e) => {
+    if (e.target && e.target.id === "btn-confirm-add-group") handleAddGroup();
+    if (e.target && e.target.id === "btn-cancel-add-group") toggleGroupAddRow(false);
+  });
+  $("#new-group-name") && $("#new-group-name").addEventListener("keydown", () => {});
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && document.activeElement && document.activeElement.id === "new-group-name") {
+      handleAddGroup();
+    }
+  });
+
+  // product entry tabs
+  $all("#product-entry-tabs .tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $all("#product-entry-tabs .tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      $("#ptab-excel").style.display = btn.dataset.ptab === "excel" ? "" : "none";
+      $("#ptab-manual").style.display = btn.dataset.ptab === "manual" ? "" : "none";
+    });
+  });
+
+  $("#btn-pick-products-file").addEventListener("click", () => $("#products-file-input").click());
+  $("#products-file-input").addEventListener("change", (e) => handleProductsFileSelected(e.target.files[0]));
+  enableFileDragDrop($("#products-file-drop"), handleProductsFileSelected);
+  $("#btn-save-manual-product").addEventListener("click", handleSaveManualProduct);
+  $("#products-search").addEventListener("input", (e) => renderProductsList(e.target.value));
+
+  $("#btn-save-line1-def").addEventListener("click", () => handleSaveLineGroups("line1"));
+  $("#btn-save-line2-def").addEventListener("click", () => handleSaveLineGroups("line2"));
+
+  $("#btn-save-targets-line1").addEventListener("click", () => handleSaveTargets("line1"));
+  $("#btn-save-targets-line2").addEventListener("click", () => handleSaveTargets("line2"));
+}
+
+function bindSettingsView() {
+  $("#btn-save-columns").addEventListener("click", handleSaveColumns);
+  $("#btn-save-lines").addEventListener("click", handleSaveLines);
+  $all("#font-size-tabs .tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => handleSetFontScale(Number(btn.dataset.fontScale)));
+  });
+  $("#btn-export-backup").addEventListener("click", handleExportBackup);
+  $("#btn-import-backup-trigger").addEventListener("click", () => $("#backup-file-input").click());
+  $("#backup-file-input").addEventListener("change", (e) => {
+    handleImportBackupFile(e.target.files[0]);
+    e.target.value = "";
+  });
+
+  $("#btn-save-sellers").addEventListener("click", handleSaveSellers);
+  $("#btn-save-report-style").addEventListener("click", handleSaveReportStyle);
+  $("#btn-reset-report-style").addEventListener("click", handleResetReportStyle);
+}
+
+async function init() {
+  await hydrateState();
+  document.documentElement.style.setProperty("--font-scale", String(state.fontScale));
+
+  renderGroupAddForm();
+  renderGroupsList();
+  populateManualGroupSelect();
+  renderProductsList();
+  renderLineGroupCheckboxes();
+  loadSettingsFormFromState();
+  populateSingleReportSelectors();
+
+  renderTargetsTab();
+  loadSellersFormFromState();
+  renderBaselineForm();
+  renderReportStyleForm();
+
+  bindNavigation();
+  bindReportsView();
+  bindManagementView();
+  bindSettingsView();
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+}
+
+document.addEventListener("DOMContentLoaded", init);
