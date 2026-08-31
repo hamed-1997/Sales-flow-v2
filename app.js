@@ -333,17 +333,23 @@ const DEFAULT_REPORT_STYLE = {
   headerSize: 15,
   bodySize: 15,
   footerSize: 15,
-  // right-to-left display order + per-column relative width + editable label
+  // right-to-left display order + per-column relative width + editable label + alignment + bold
   columnOrder: ["product", "target", "today", "cumulative", "remaining"],
   columnWeights: { product: 24, target: 19, today: 19, cumulative: 19, remaining: 19 },
   columnLabels: { product: "کالا", target: "هدف ماه", today: "فروش امروز", cumulative: "فروش از ابتدای ماه", remaining: "مانده تا هدف" },
+  columnAlign: { product: "right", target: "center", today: "center", cumulative: "center", remaining: "center" },
+  columnBold: { product: true, target: false, today: false, cumulative: false, remaining: false },
   // right-to-left display order + relative width + editable label for the footer stats row
   footerOrder: ["customer", "perRep", "invalid"],
   footerWeights: { customer: 2, perRep: 1, invalid: 2 },
   footerLabels: { customer: "مشتری امروز", perRep: "سرانه", invalid: "درصد ابطالی" },
   titleTemplate: "گزارش فروش {line}",
   dateTemplate: "تاریخ: {date}",
-  rowHeights: { title: 46, header: 36, data: 32, total: 36, footer: 36 },
+  titleBold: true,
+  headerBold: true,
+  footerBold: true,
+  rowHeights: { title: 46, header: 36, data: 32, total: 36, spacer: 24, footer: 36 },
+  spacerBg: "#0070c0",
   dateCellBg: "#002d82",
   dateCellText: "#ffffff",
   titleCellBg: "#9bc1e6",
@@ -376,6 +382,8 @@ function sanitizeReportStyle(raw) {
   const s = { ...DEFAULT_REPORT_STYLE, ...(raw || {}) };
   s.columnWeights = { ...DEFAULT_REPORT_STYLE.columnWeights, ...(raw?.columnWeights && !Array.isArray(raw.columnWeights) ? raw.columnWeights : {}) };
   s.columnLabels = { ...DEFAULT_REPORT_STYLE.columnLabels, ...(raw?.columnLabels || {}) };
+  s.columnAlign = { ...DEFAULT_REPORT_STYLE.columnAlign, ...(raw?.columnAlign || {}) };
+  s.columnBold = { ...DEFAULT_REPORT_STYLE.columnBold, ...(raw?.columnBold || {}) };
   s.columnOrder = Array.isArray(raw?.columnOrder) && REPORT_COLUMN_KEYS.every((k) => raw.columnOrder.includes(k)) && raw.columnOrder.length === REPORT_COLUMN_KEYS.length
     ? raw.columnOrder
     : [...DEFAULT_REPORT_STYLE.columnOrder];
@@ -1234,6 +1242,10 @@ async function renderBaselineTab() {
         <label>فروش تا تاریخ (خالی = ابتدای ماه / صفر)</label>
         <input type="text" class="baseline-date-input" data-line="${lineKey}" placeholder="مثلاً 1405/05/24" value="${escapeHtml(b.date || "")}" />
       </div>
+      <div class="row" style="margin-bottom:var(--space-4); flex-wrap:wrap">
+        <button type="button" class="btn btn-secondary btn-sm" data-baseline-upload="${lineKey}">${icon("upload")} محاسبه خودکار از فایل اکسل (فروش از اول ماه تا تاریخ بالا)</button>
+        <input type="file" class="baseline-file-input" data-line="${lineKey}" accept=".xlsx,.xls,.csv" style="display:none" />
+      </div>
       <div class="order-list">
         ${groups
           .map(
@@ -1263,6 +1275,59 @@ async function renderBaselineTab() {
   $all("[data-baseline-clear]").forEach((btn) => {
     btn.addEventListener("click", () => handleClearBaselineLine(btn.dataset.baselineClear));
   });
+  $all("[data-baseline-upload]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const lineKey = btn.dataset.baselineUpload;
+      $(`.baseline-file-input[data-line="${lineKey}"]`).click();
+    });
+  });
+  $all(".baseline-file-input").forEach((input) => {
+    input.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (file) handleBaselineFileSelected(input.dataset.line, file);
+      e.target.value = "";
+    });
+  });
+}
+
+/**
+ * Lets the user upload a sales-report Excel file that already spans from
+ * day 1 of the month through whatever date they want ("فروش تا تاریخ" above)
+ * — instead of typing each group's cumulative total by hand. Runs the exact
+ * same grouping/rounding logic used for the daily report
+ * (computeSalesReport + buildLineReportRows) against the uploaded file,
+ * scoped to this one line, and fills the form's number fields with the
+ * result so the user only has to review and save.
+ */
+async function handleBaselineFileSelected(lineKey, file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const workbook = readWorkbookFromArrayBuffer(buf);
+    const info = getFirstSheetInfo(workbook);
+    if (!info) { showToast("فایل معتبر نیست", "error"); return; }
+    const valid = validateColumnsExist(info.range, state.columnMap);
+    if (!valid.ok) { showToast(`ستون «${valid.field}» در این فایل پیدا نشد`, "error"); return; }
+    if (!state.lines[lineKey]?.excelValue) {
+      showToast("ابتدا مقدار دقیق این لاین را در تنظیمات وارد کنید", "error");
+      return;
+    }
+    const productMap = new Map(state.products.map((p) => [p.code, p]));
+    const groupsById = new Map(state.groups.map((g) => [g.id, g]));
+    const { line1, line2 } = computeSalesReport(info.rows, state.columnMap, state.lines, productMap, groupsById);
+    const lineResult = lineKey === "line1" ? line1 : line2;
+    const built = buildLineReportRows(lineResult.groupSumsDisplay, lineResult.groupSumsCartonEquivalent, state.lineGroups[lineKey]);
+
+    const slot = $(`#baseline-${lineKey}-slot`);
+    built.rows.forEach((r) => {
+      const input = $(`.baseline-amount-input[data-group="${r.groupId}"]`, slot);
+      if (input) input.value = r.rounded;
+    });
+    const totalInput = $(".baseline-total-input", slot);
+    if (totalInput) totalInput.value = built.totalRounded;
+    showToast("مقادیر از فایل محاسبه شد — بررسی کنید و «ذخیره» بزنید", "success");
+  } catch (err) {
+    showToast("خطا در خواندن یا پردازش فایل", "error");
+  }
 }
 
 async function handleSaveBaselineLine(lineKey) {
@@ -1310,6 +1375,7 @@ const REPORT_STYLE_COLOR_FIELDS = [
   { key: "dataRowText", label: "متن ردیف‌های داده" },
   { key: "totalRowBg", label: "پس‌زمینه ردیف کل محصولات" },
   { key: "totalRowText", label: "متن ردیف کل محصولات" },
+  { key: "spacerBg", label: "رنگ نوار آبی خالی" },
   { key: "remainingPositiveText", label: "متن «مانده» مثبت" },
   { key: "remainingNegativeText", label: "متن «مانده» منفی" },
   { key: "footerCustomerBg", label: "پس‌زمینه تعداد مشتری" },
@@ -1320,14 +1386,21 @@ const REPORT_STYLE_COLOR_FIELDS = [
   { key: "footerInvalidText", label: "متن درصد ابطال" },
   { key: "borderColor", label: "رنگ خطوط جدول" },
 ];
-const FONT_FAMILY_OPTIONS = [["Vazirmatn", "وزیرمتن"], ["Tahoma, sans-serif", "Tahoma"], ["'Segoe UI', sans-serif", "Segoe UI"]];
-const ROW_HEIGHT_LABELS = { title: "ارتفاع ردیف عنوان", header: "ارتفاع ردیف هدر", data: "ارتفاع ردیف‌های داده", total: "ارتفاع ردیف کل", footer: "ارتفاع ردیف پایین" };
-const FONT_SECTION_LABELS = [
-  { sizeKey: "titleSize", familyKey: "titleFontFamily", label: "عنوان اصلی" },
-  { sizeKey: "headerSize", familyKey: "headerFontFamily", label: "هدر ستون‌ها" },
-  { sizeKey: "bodySize", familyKey: "bodyFontFamily", label: "محتوای جدول" },
-  { sizeKey: "footerSize", familyKey: "footerFontFamily", label: "ردیف پایین" },
+const FONT_FAMILY_OPTIONS = [
+  ["Vazirmatn", "وزیرمتن"],
+  ["Tahoma, sans-serif", "Tahoma"],
+  ["'Segoe UI', sans-serif", "Segoe UI"],
+  ["'B Mitra', Tahoma, sans-serif", "B Mitra"],
+  ["Calibri, sans-serif", "Calibri"],
 ];
+const ROW_HEIGHT_LABELS = { title: "ارتفاع ردیف عنوان", header: "ارتفاع ردیف هدر", data: "ارتفاع ردیف‌های داده", total: "ارتفاع ردیف کل", spacer: "ارتفاع نوار آبی خالی", footer: "ارتفاع ردیف پایین" };
+const FONT_SECTION_LABELS = [
+  { sizeKey: "titleSize", familyKey: "titleFontFamily", boldKey: "titleBold", label: "عنوان اصلی" },
+  { sizeKey: "headerSize", familyKey: "headerFontFamily", boldKey: "headerBold", label: "هدر ستون‌ها" },
+  { sizeKey: "bodySize", familyKey: "bodyFontFamily", boldKey: null, label: "محتوای جدول (بولد هر ستون پایین‌تر تنظیم می‌شود)" },
+  { sizeKey: "footerSize", familyKey: "footerFontFamily", boldKey: "footerBold", label: "ردیف پایین" },
+];
+const ALIGN_OPTIONS = [["right", "راست‌چین"], ["center", "وسط‌چین"], ["left", "چپ‌چین"]];
 
 // Pending (not-yet-saved) reorder state for the two draggable lists in the
 // report-style form — mutated by drag/up-down, read by collectReportStyleFormValues.
@@ -1371,12 +1444,16 @@ function renderReportStyleForm() {
         <div class="field">
           <label>سایز ${escapeHtml(f.label)} (px)</label>
           <input type="number" class="style-input" data-style-key="${f.sizeKey}" min="8" max="60" value="${S[f.sizeKey]}" />
-        </div>`
+        </div>
+        ${f.boldKey ? `
+        <div class="field" style="justify-content:flex-end">
+          <label class="checkbox-label"><input type="checkbox" class="style-input-bold" data-style-key="${f.boldKey}" ${S[f.boldKey] ? "checked" : ""} /> بولد باشد</label>
+        </div>` : ""}`
       ).join("")}
     </div>
 
-    <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب و عرض</div>
-    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره یا دکمه‌های بالا/پایین ترتیب نمایش (راست به چپ) را عوض کنید؛ برچسب هر ستون و عرض نسبی‌اش هم قابل ویرایش است.</div>
+    <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب، عرض، چینش و بولد</div>
+    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره یا دکمه‌های بالا/پایین ترتیب نمایش (راست به چپ) را عوض کنید؛ برچسب، عرض، چینش متن و بولد هر ستون هم قابل ویرایش است (هم برای هدر و هم برای ردیف‌های داده و جمع همان ستون).</div>
     <div id="column-order-slot"></div>
 
     <div class="settings-subhead">ردیف پایین (مشتری/سرانه/ابطالی) — ترتیب، برچسب و عرض</div>
@@ -1388,7 +1465,7 @@ function renderReportStyleForm() {
         (k) => `
         <div class="field">
           <label>${escapeHtml(ROW_HEIGHT_LABELS[k])}</label>
-          <input type="number" class="style-input-rowh" data-row-key="${k}" min="16" max="120" value="${S.rowHeights[k]}" />
+          <input type="number" class="style-input-rowh" data-row-key="${k}" min="4" max="120" value="${S.rowHeights[k]}" />
         </div>`
       ).join("")}
     </div>
@@ -1419,10 +1496,14 @@ function renderColumnOrderList() {
   slot.innerHTML = `<div class="order-list">${pendingColumnOrder
     .map(
       (key, idx) => `
-      <div class="order-item" draggable="true" data-col-key="${key}">
+      <div class="order-item order-item-wrap" draggable="true" data-col-key="${key}">
         <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
-        <input type="text" class="style-input-collabel" data-col-key="${key}" value="${escapeHtml(S.columnLabels[key])}" style="flex:1;min-width:0" />
-        <input type="number" class="style-input-colw" data-col-key="${key}" min="1" value="${S.columnWeights[key]}" style="width:70px" title="عرض نسبی" />
+        <input type="text" class="style-input-collabel" data-col-key="${key}" value="${escapeHtml(S.columnLabels[key])}" style="flex:1;min-width:90px" />
+        <select class="style-input-colalign" data-col-key="${key}" style="width:100px" title="چینش متن">
+          ${ALIGN_OPTIONS.map(([v, l]) => `<option value="${v}" ${v === S.columnAlign[key] ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+        </select>
+        <input type="number" class="style-input-colw" data-col-key="${key}" min="1" value="${S.columnWeights[key]}" style="width:64px" title="عرض نسبی" />
+        <label class="checkbox-label" style="white-space:nowrap"><input type="checkbox" class="style-input-colbold" data-col-key="${key}" ${S.columnBold[key] ? "checked" : ""} /> بولد</label>
         <div class="move-btns">
           <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="up" data-col-key="${key}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
           <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="down" data-col-key="${key}" ${idx === pendingColumnOrder.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
@@ -1528,10 +1609,15 @@ function collectReportStyleFormValues() {
     const isNumberField = key.endsWith("Size");
     s[key] = isNumberField ? Number(input.value) || state.reportStyle[key] : input.value;
   });
+  $all(".style-input-bold", slot).forEach((input) => {
+    s[input.dataset.styleKey] = input.checked;
+  });
 
   s.columnOrder = [...pendingColumnOrder];
   const columnWeights = { ...state.reportStyle.columnWeights };
   const columnLabels = { ...state.reportStyle.columnLabels };
+  const columnAlign = { ...state.reportStyle.columnAlign };
+  const columnBold = { ...state.reportStyle.columnBold };
   $all(".style-input-colw", slot).forEach((input) => {
     const v = Number(input.value);
     if (v > 0) columnWeights[input.dataset.colKey] = v;
@@ -1539,8 +1625,16 @@ function collectReportStyleFormValues() {
   $all(".style-input-collabel", slot).forEach((input) => {
     if (input.value.trim()) columnLabels[input.dataset.colKey] = input.value.trim();
   });
+  $all(".style-input-colalign", slot).forEach((input) => {
+    columnAlign[input.dataset.colKey] = input.value;
+  });
+  $all(".style-input-colbold", slot).forEach((input) => {
+    columnBold[input.dataset.colKey] = input.checked;
+  });
   s.columnWeights = columnWeights;
   s.columnLabels = columnLabels;
+  s.columnAlign = columnAlign;
+  s.columnBold = columnBold;
 
   s.footerOrder = [...pendingFooterOrder];
   const footerWeights = { ...state.reportStyle.footerWeights };
@@ -2227,18 +2321,17 @@ function computeColumnBoundsRTL(weights, canvasWidth) {
 }
 
 /** Draws one line's full-day report (title+date, column headers, one row
- * per product group, total row, footer stats row) directly with the
- * Canvas 2D API — column widths, row heights, per-section fonts/sizes and
- * every color come from `S` (state.reportStyle, or a live-preview draft of
- * it) — and returns the finished <canvas>. Pure vector drawing avoids the
- * "tainted canvas" restriction that an SVG/foreignObject round-trip runs
- * into. */
+ * per product group, a blank spacer bar, total row, footer stats row)
+ * directly with the Canvas 2D API — column widths, row heights, per-section
+ * fonts/sizes/bold, per-column alignment/bold and every color come from `S`
+ * (state.reportStyle, or a live-preview draft of it) — and returns the
+ * finished <canvas>. Pure vector drawing avoids the "tainted canvas"
+ * restriction that an SVG/foreignObject round-trip runs into. */
 async function drawReportCanvas(data, S) {
   const scale = 2; // export at 2x for crisp screenshots
   const widthCss = 660;
   const rowH = S.rowHeights;
-  const padTop = 6, padBottom = 6;
-  const heightCss = padTop + rowH.title + rowH.header + data.rows.length * rowH.data + rowH.total + rowH.footer + padBottom;
+  const heightCss = rowH.title + rowH.header + data.rows.length * rowH.data + rowH.total + rowH.spacer + rowH.footer;
 
   await ensureReportFontsLoaded([S.titleSize, S.headerSize, S.bodySize, S.footerSize, Math.round(S.titleSize * 0.7)]);
 
@@ -2270,31 +2363,34 @@ async function drawReportCanvas(data, S) {
     ctx.lineWidth = 1;
     ctx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0 - 1, y1 - y0 - 1);
   }
-  function text(str, cx, cy, size, color, weight, family, dir, maxWidth) {
+  /** align: "right" | "center" | "left" — physical, independent of ctx.direction. */
+  function text(str, b, y, size, color, bold, family, align, numeric) {
+    const pad = 8;
     ctx.fillStyle = color;
-    ctx.font = `${weight} ${size}px ${family}, Tahoma, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.direction = dir || "rtl";
-    ctx.fillText(String(str), cx, cy, maxWidth);
+    ctx.font = `${bold ? "700" : "400"} ${size}px ${family}, Tahoma, sans-serif`;
+    ctx.direction = numeric ? "ltr" : "rtl";
+    ctx.textAlign = align === "right" ? "right" : align === "left" ? "left" : "center";
+    const x = align === "right" ? b.x1 - pad : align === "left" ? b.x0 + pad : (b.x0 + b.x1) / 2;
+    ctx.fillText(String(str), x, y, b.w - pad * 2);
     ctx.direction = "rtl";
   }
 
-  let y = padTop;
+  let y = 0;
 
   // ---- title row: rightmost 3 column-slots = report title, leftmost 2 = date ----
-  const titleX0 = bounds[2].x0, titleX1 = bounds[0].x1;
-  const dateX0 = bounds[4].x0, dateX1 = bounds[3].x1;
-  cell(titleX0, titleX1, y, y + rowH.title, S.titleCellBg);
-  cell(dateX0, dateX1, y, y + rowH.title, S.dateCellBg);
-  text(S.titleTemplate.replace("{line}", data.lineLabel), (titleX0 + titleX1) / 2, y + rowH.title / 2, S.titleSize, S.titleCellText, "700", S.titleFontFamily, "rtl", (titleX1 - titleX0) * 0.94);
-  text(S.dateTemplate.replace("{date}", toPersianDigits(data.dateStr)), (dateX0 + dateX1) / 2, y + rowH.title / 2, Math.round(S.titleSize * 0.7), S.dateCellText, "700", S.titleFontFamily, "rtl", (dateX1 - dateX0) * 0.94);
+  const titleB = { x0: bounds[2].x0, x1: bounds[0].x1, w: bounds[0].x1 - bounds[2].x0 };
+  const dateB = { x0: bounds[4].x0, x1: bounds[3].x1, w: bounds[3].x1 - bounds[4].x0 };
+  cell(titleB.x0, titleB.x1, y, y + rowH.title, S.titleCellBg);
+  cell(dateB.x0, dateB.x1, y, y + rowH.title, S.dateCellBg);
+  text(S.titleTemplate.replace("{line}", data.lineLabel), titleB, y + rowH.title / 2, S.titleSize, S.titleCellText, S.titleBold, S.titleFontFamily, "center", false);
+  text(S.dateTemplate.replace("{date}", toPersianDigits(data.dateStr)), dateB, y + rowH.title / 2, Math.round(S.titleSize * 0.7), S.dateCellText, S.titleBold, S.titleFontFamily, "center", false);
   y += rowH.title;
 
-  // ---- column header row ----
+  // ---- column header row (alignment follows the column's own align) ----
   S.columnOrder.forEach((key) => {
     const b = colBoundsByKey[key];
     cell(b.x0, b.x1, y, y + rowH.header, S.headerRowBg);
-    text(S.columnLabels[key], (b.x0 + b.x1) / 2, y + rowH.header / 2, S.headerSize, S.headerRowText, "700", S.headerFontFamily, "rtl", b.w * 0.92);
+    text(S.columnLabels[key], b, y + rowH.header / 2, S.headerSize, S.headerRowText, S.headerBold, S.headerFontFamily, S.columnAlign[key], false);
   });
   y += rowH.header;
 
@@ -2312,7 +2408,7 @@ async function drawReportCanvas(data, S) {
       const b = colBoundsByKey[key];
       cell(b.x0, b.x1, y, y + rowH.data, S.dataRowBg);
       const color = key === "remaining" ? (r.remaining == null ? S.dataRowText : r.remaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.dataRowText;
-      text(valuesByKey[key], (b.x0 + b.x1) / 2, y + rowH.data / 2, S.bodySize, color, key === "product" ? "700" : "400", S.bodyFontFamily, key === "product" ? "rtl" : "ltr", b.w * 0.92);
+      text(valuesByKey[key], b, y + rowH.data / 2, S.bodySize, color, S.columnBold[key], S.bodyFontFamily, S.columnAlign[key], key !== "product");
     });
     y += rowH.data;
   }
@@ -2330,10 +2426,14 @@ async function drawReportCanvas(data, S) {
       const b = colBoundsByKey[key];
       cell(b.x0, b.x1, y, y + rowH.total, S.totalRowBg);
       const color = key === "remaining" ? (data.totalRemaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.totalRowText;
-      text(valuesByKey[key], (b.x0 + b.x1) / 2, y + rowH.total / 2, S.bodySize, color, "700", S.bodyFontFamily, key === "product" ? "rtl" : "ltr", b.w * 0.92);
+      text(valuesByKey[key], b, y + rowH.total / 2, S.bodySize, color, true, S.bodyFontFamily, S.columnAlign[key], key !== "product");
     });
     y += rowH.total;
   }
+
+  // ---- blank blue spacer bar (matches the sample report exactly) ----
+  cell(bounds[4].x0, bounds[0].x1, y, y + rowH.spacer, S.spacerBg);
+  y += rowH.spacer;
 
   // ---- footer stats row — order/labels/widths from S.footerOrder ----
   {
@@ -2346,7 +2446,7 @@ async function drawReportCanvas(data, S) {
       const b = footerBoundsByKey[key];
       cell(b.x0, b.x1, y, y + rowH.footer, bgByKey[key]);
       const label = `${S.footerLabels[key]}: ${valuesByKey[key]}`;
-      text(label, (b.x0 + b.x1) / 2, y + rowH.footer / 2, key === "perRep" ? Math.max(11, S.footerSize - 2) : S.footerSize, textColorByKey[key], "700", S.footerFontFamily, "rtl", b.w * 0.92);
+      text(label, b, y + rowH.footer / 2, key === "perRep" ? Math.max(11, S.footerSize - 2) : S.footerSize, textColorByKey[key], S.footerBold, S.footerFontFamily, "center", false);
     });
   }
 

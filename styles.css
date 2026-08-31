@@ -533,6 +533,10 @@ table.data-table td.num, table.data-table th.num { text-align: left; }
   cursor: default;
 }
 .order-item.table-row-total .name { font-weight: 700; color: var(--color-accent-600); }
+.order-item-wrap { flex-wrap: wrap; cursor: default; }
+.order-item-wrap .drag-handle { cursor: grab; }
+.checkbox-label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--font-size-sm); cursor: pointer; white-space: nowrap; }
+.checkbox-label input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--color-accent-600); cursor: pointer; }
 .order-item.table-row-total .count { font-size: var(--font-size-xs); }
 .order-item .move-btns { display: flex; gap: 2px; }
 
