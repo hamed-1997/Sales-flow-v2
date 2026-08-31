@@ -77,6 +77,47 @@ function toPersianDigits(v) {
 function jalaliMonthName(m) {
   return ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"][m - 1] || "";
 }
+/** Jalali -> Gregorian [gy, gm(1-12), gd]. Standard public-domain algorithm
+ * (inverse of gregorianToJalali) — used only to do reliable day-arithmetic
+ * (e.g. "yesterday") via the native Date object, then convert back. */
+function jalaliToGregorian(jy, jm, jd) {
+  jy += 1595;
+  let days = -355668 + 365 * jy + Math.floor(jy / 33) * 8 + Math.floor(((jy % 33) + 3) / 4) + jd +
+    (jm < 7 ? (jm - 1) * 31 : (jm - 7) * 30 + 186);
+  let gy = 400 * Math.floor(days / 146097);
+  days %= 146097;
+  if (days > 36524) {
+    gy += 100 * Math.floor(--days / 36524);
+    days %= 36524;
+    if (days >= 365) days++;
+  }
+  gy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) { gy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
+  let gd = days + 1;
+  const isLeap = (gy % 4 === 0 && gy % 100 !== 0) || gy % 400 === 0;
+  const monthDays = [0, 31, isLeap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  let gm = 0;
+  for (gm = 1; gm <= 12; gm++) {
+    if (gd <= monthDays[gm]) break;
+    gd -= monthDays[gm];
+  }
+  return [gy, gm, gd];
+}
+/** Adds (or subtracts, with a negative delta) whole days to a Jalali date,
+ * round-tripping through Gregorian/native Date so calendar-length quirks
+ * (leap years, 30 vs 31-day months) are handled correctly either way. */
+function jalaliAddDays(jy, jm, jd, deltaDays) {
+  const [gy, gm, gd] = jalaliToGregorian(jy, jm, jd);
+  const d = new Date(gy, gm - 1, gd);
+  d.setDate(d.getDate() + deltaDays);
+  return gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
+}
+function yesterdayJalaliStr() {
+  const [y, m, d] = todayJalali();
+  const [yy, mm, dd] = jalaliAddDays(y, m, d, -1);
+  return jalaliToStr(yy, mm, dd);
+}
 
 /* ---------------------------------------------------------
    1. Toasts
@@ -250,31 +291,30 @@ async function saveDailySaleFull(dateStr, line, rows, totalToday) {
 }
 
 /**
- * Cumulative sale for `line`, from the configured monthBaseline through
- * (and including) `uptoDateStr` — both per product-group and as a line
- * total. If no entry for `uptoDateStr` has been saved yet (e.g. today,
- * before pressing "ذخیره فروش روز"), it's simply not counted yet — callers
- * add today's not-yet-saved amount on top when needed.
+ * Cumulative sale for `line`, from the configured baseline (مدیریت › فروش
+ * تا روز قبل) through (and including) `uptoDateStr` — both per
+ * product-group and as a line total. If no entry for `uptoDateStr` has been
+ * saved yet (e.g. today, before pressing "ذخیره فروش روز"), it's simply not
+ * counted yet — callers add today's not-yet-saved amount on top when
+ * needed.
  *
- * Note: the manual mid-month baseline (تنظیمات > نقطه شروع تجمعی ماه) is a
- * single total figure per line, not broken down per group — so it only
- * seeds the line TOTAL's cumulative. Per-group cumulative starts counting
- * from whichever day the app began saving daily reports.
+ * The baseline now carries a full per-group breakdown (not just a total),
+ * so both individual rows and the total row are accurate from the baseline
+ * date forward, even when starting mid-month.
  */
 async function getMonthCumulativeRows(line, uptoDateStr) {
   const monthPrefix = uptoDateStr.slice(0, 7); // "YYYY/MM"
-  const baseline = state.monthBaseline[line] || { date: "", amount: 0 };
+  const baseline = state.monthBaseline[line] || { date: "", amounts: {}, total: 0 };
+  const baselineAppliesThisMonth = !!baseline.date && baseline.date.slice(0, 7) === monthPrefix;
   const all = await Store.getAll("salesLog");
   const logs = all.filter((e) => e.line === line && e.date.slice(0, 7) === monthPrefix && e.date <= uptoDateStr &&
     (!baseline.date || e.date > baseline.date));
-  const byGroup = {};
-  let total = 0;
+  const byGroup = baselineAppliesThisMonth ? { ...baseline.amounts } : {};
+  let total = baselineAppliesThisMonth ? (baseline.total || 0) : baseline.date ? 0 : (baseline.total || 0);
   for (const e of logs) {
     total += e.totalToday || 0;
     (e.rows || []).forEach((r) => { byGroup[r.groupId] = (byGroup[r.groupId] || 0) + (r.todaySale || 0); });
   }
-  const baseAmount = baseline.date && baseline.date.slice(0, 7) === monthPrefix ? (baseline.amount || 0) : (baseline.date ? 0 : (baseline.amount || 0));
-  total += baseAmount;
   return { byGroup, total };
 }
 
@@ -384,9 +424,9 @@ const state = {
   monthlyTargets: { line1: {}, line2: {} },  // { line1: {groupId: number}, line2: {...} }
   targetTotals: { line1: 0, line2: 0 },       // separately-announced total target per line
   sellersCount: { line1: 0, line2: 0 },
-  monthBaseline: {                             // مبدأ تجمعی ماه، برای شروع از وسط ماه
-    line1: { date: "", amount: 0 },
-    line2: { date: "", amount: 0 },
+  monthBaseline: {                             // فروش تا روز قبل — مبدأ تجمعی ماه، به‌تفکیک گروه کالا
+    line1: { date: "", amounts: {}, total: 0 },
+    line2: { date: "", amounts: {}, total: 0 },
   },
   reportStyle: { ...DEFAULT_REPORT_STYLE },
 };
@@ -404,7 +444,11 @@ async function hydrateState() {
   state.monthlyTargets = await getSetting("monthlyTargets", state.monthlyTargets);
   state.targetTotals = await getSetting("targetTotals", state.targetTotals);
   state.sellersCount = await getSetting("sellersCount", state.sellersCount);
-  state.monthBaseline = await getSetting("monthBaseline", state.monthBaseline);
+  const rawBaseline = await getSetting("monthBaseline", state.monthBaseline);
+  state.monthBaseline = {
+    line1: { date: rawBaseline?.line1?.date || "", amounts: rawBaseline?.line1?.amounts || {}, total: rawBaseline?.line1?.total ?? rawBaseline?.line1?.amount ?? 0 },
+    line2: { date: rawBaseline?.line2?.date || "", amounts: rawBaseline?.line2?.amounts || {}, total: rawBaseline?.line2?.total ?? rawBaseline?.line2?.amount ?? 0 },
+  };
   state.reportStyle = sanitizeReportStyle(await getSetting("reportStyle", {}));
 }
 
@@ -1026,6 +1070,7 @@ async function handleSaveLineGroups(lineKey) {
   await setSetting("lineGroups", state.lineGroups);
   showToast(`تنظیمات ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
   renderTargetsTab(); // group selection changed — target rows follow it
+  renderBaselineTab(); // ditto — baseline rows follow the same group selection
 }
 
 /* ---------------------------------------------------------
@@ -1162,60 +1207,92 @@ async function handleSaveSellers() {
   showToast("تعداد فروشنده هر لاین ذخیره شد", "success");
 }
 
-function renderBaselineForm() {
-  const slot = $("#baseline-form-slot");
-  if (!slot) return;
-  const b1 = state.monthBaseline.line1 || { date: "", amount: 0 };
-  const b2 = state.monthBaseline.line2 || { date: "", amount: 0 };
-  slot.innerHTML = `
-    <div class="form-grid">
-      <div class="field">
-        <label><span class="line-dot line1"></span> تاریخ مبدأ لاین یک (مثلاً 1405/05/24)</label>
-        <input type="text" id="baseline-date-line1" placeholder="خالی = ابتدای ماه" value="${escapeHtml(b1.date || "")}" />
+/* ---------------------------------------------------------
+   9d. مدیریت › فروش تا روز قبل — مبدأ تجمعی، به‌تفکیک گروه کالا
+   --------------------------------------------------------- */
+/** For prefilling the form: what the app currently computes as each line's
+ * cumulative-through-yesterday (using whatever baseline + saved daily logs
+ * already exist) — a convenient starting point the user can then edit. */
+async function renderBaselineTab() {
+  for (const lineKey of ["line1", "line2"]) {
+    const slot = $(`#baseline-${lineKey}-slot`);
+    if (!slot) continue;
+    const ids = state.lineGroups[lineKey] || [];
+    const groups = ids.map((id) => groupById(id)).filter(Boolean);
+    if (!groups.length) {
+      slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-calendar"></use></svg></div><div class="title">ابتدا گروه‌های این لاین را در «تعریف گزارش کلی» انتخاب کنید</div></div>`;
+      continue;
+    }
+    const b = state.monthBaseline[lineKey] || { date: "", amounts: {}, total: 0 };
+    const computedThroughDate = b.date || yesterdayJalaliStr();
+    const computed = await getMonthCumulativeRows(lineKey, computedThroughDate);
+    slot.innerHTML = `
+      <div class="field-hint" style="margin-bottom:var(--space-3)">
+        مقادیر پایین، «فروش تا ${escapeHtml(toPersianDigits(computedThroughDate))}» است — همان چیزی که الان محاسبه شده؛ هر عددی را می‌توانید دستی اصلاح کنید.
       </div>
-      <div class="field">
-        <label>فروش تا آن تاریخ — لاین یک</label>
-        <input type="number" id="baseline-amount-line1" min="0" step="1" value="${b1.amount || ""}" />
+      <div class="field" style="margin-bottom:var(--space-4)">
+        <label>فروش تا تاریخ (خالی = ابتدای ماه / صفر)</label>
+        <input type="text" class="baseline-date-input" data-line="${lineKey}" placeholder="مثلاً 1405/05/24" value="${escapeHtml(b.date || "")}" />
       </div>
-      <div class="field">
-        <label><span class="line-dot line2"></span> تاریخ مبدأ لاین دو (مثلاً 1405/05/24)</label>
-        <input type="text" id="baseline-date-line2" placeholder="خالی = ابتدای ماه" value="${escapeHtml(b2.date || "")}" />
+      <div class="order-list">
+        ${groups
+          .map(
+            (g) => `
+          <div class="order-item" style="cursor:default">
+            <span class="name">${escapeHtml(g.name)}</span>
+            <input type="number" min="0" step="1" class="baseline-amount-input" data-line="${lineKey}" data-group="${g.id}"
+              value="${computed.byGroup[g.id] != null ? computed.byGroup[g.id] : ""}" placeholder="فروش تا تاریخ" style="width:130px" />
+          </div>`
+          )
+          .join("")}
+        <div class="order-item table-row-total" style="cursor:default">
+          <span class="name">مجموع فروش تا تاریخ — ${lineKey === "line1" ? "لاین یک" : "لاین دو"}</span>
+          <input type="number" min="0" step="1" class="baseline-total-input" data-line="${lineKey}" style="width:130px"
+            value="${computed.total || ""}" placeholder="مجموع" />
+        </div>
       </div>
-      <div class="field">
-        <label>فروش تا آن تاریخ — لاین دو</label>
-        <input type="number" id="baseline-amount-line2" min="0" step="1" value="${b2.amount || ""}" />
-      </div>
-    </div>
-    <div class="row" style="margin-top: var(--space-5); flex-wrap:wrap">
-      <button class="btn btn-primary" id="btn-save-baseline">${icon("save")} ذخیره مبدأ تجمعی</button>
-      <button class="btn btn-secondary" id="btn-clear-baseline">${icon("trash")} شروع ماه جدید (صفر کردن)</button>
-    </div>`;
-  $("#btn-save-baseline").addEventListener("click", handleSaveBaseline);
-  $("#btn-clear-baseline").addEventListener("click", handleClearBaseline);
+      <div class="row" style="margin-top: var(--space-4); flex-wrap:wrap">
+        <button class="btn btn-primary" data-baseline-save="${lineKey}">${icon("save")} ذخیره — ${lineKey === "line1" ? "لاین یک" : "لاین دو"}</button>
+        <button class="btn btn-secondary" data-baseline-clear="${lineKey}">${icon("trash")} شروع ماه جدید (صفر کردن)</button>
+      </div>`;
+  }
+
+  $all("[data-baseline-save]").forEach((btn) => {
+    btn.addEventListener("click", () => handleSaveBaselineLine(btn.dataset.baselineSave));
+  });
+  $all("[data-baseline-clear]").forEach((btn) => {
+    btn.addEventListener("click", () => handleClearBaselineLine(btn.dataset.baselineClear));
+  });
 }
 
-async function handleSaveBaseline() {
-  const d1 = normalizeStr($("#baseline-date-line1").value);
-  const a1 = toPersianSafeNumber($("#baseline-amount-line1").value);
-  const d2 = normalizeStr($("#baseline-date-line2").value);
-  const a2 = toPersianSafeNumber($("#baseline-amount-line2").value);
-  if ((d1 && !/^\d{4}\/\d{2}\/\d{2}$/.test(d1)) || (d2 && !/^\d{4}\/\d{2}\/\d{2}$/.test(d2))) {
+async function handleSaveBaselineLine(lineKey) {
+  const slot = $(`#baseline-${lineKey}-slot`);
+  if (!slot) return;
+  const dateInput = $(".baseline-date-input", slot);
+  const date = normalizeStr(dateInput ? dateInput.value : "");
+  if (date && !/^\d{4}\/\d{2}\/\d{2}$/.test(date)) {
     showToast("فرمت تاریخ باید مثل 1405/05/24 باشد", "error");
     return;
   }
-  state.monthBaseline = {
-    line1: { date: d1, amount: isNaN(a1) ? 0 : a1 },
-    line2: { date: d2, amount: isNaN(a2) ? 0 : a2 },
-  };
+  const amounts = {};
+  $all(".baseline-amount-input", slot).forEach((input) => {
+    const gid = Number(input.dataset.group);
+    const v = toPersianSafeNumber(input.value);
+    if (!isNaN(v)) amounts[gid] = v;
+  });
+  const totalInput = $(".baseline-total-input", slot);
+  const total = toPersianSafeNumber(totalInput ? totalInput.value : "");
+  state.monthBaseline[lineKey] = { date, amounts, total: isNaN(total) ? 0 : total };
   await setSetting("monthBaseline", state.monthBaseline);
-  showToast("نقطه شروع تجمعی ماه ذخیره شد", "success");
+  showToast(`فروش تا روز قبل — ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
+  renderBaselineTab();
 }
 
-async function handleClearBaseline() {
-  state.monthBaseline = { line1: { date: "", amount: 0 }, line2: { date: "", amount: 0 } };
+async function handleClearBaselineLine(lineKey) {
+  state.monthBaseline[lineKey] = { date: "", amounts: {}, total: 0 };
   await setSetting("monthBaseline", state.monthBaseline);
-  renderBaselineForm();
-  showToast("مبدأ تجمعی صفر شد — این ماه از صفر محاسبه می‌شود", "success");
+  showToast(`${lineKey === "line1" ? "لاین یک" : "لاین دو"} برای ماه جدید صفر شد`, "success");
+  renderBaselineTab();
 }
 
 /** Field definitions for the "colors" part of the report-appearance form —
@@ -2562,7 +2639,7 @@ async function init() {
 
   renderTargetsTab();
   loadSellersFormFromState();
-  renderBaselineForm();
+  renderBaselineTab();
   renderReportStyleForm();
 
   bindNavigation();
