@@ -305,12 +305,14 @@ async function saveDailySaleFull(dateStr, line, rows, totalToday) {
 async function getMonthCumulativeRows(line, uptoDateStr) {
   const monthPrefix = uptoDateStr.slice(0, 7); // "YYYY/MM"
   const baseline = state.monthBaseline[line] || { date: "", amounts: {}, total: 0 };
-  const baselineAppliesThisMonth = !!baseline.date && baseline.date.slice(0, 7) === monthPrefix;
+  // An empty date means "start of month" — the baseline always applies (day
+  // one onward), not just when its (nonexistent) date matches this month.
+  const baselineApplies = !baseline.date || baseline.date.slice(0, 7) === monthPrefix;
   const all = await Store.getAll("salesLog");
   const logs = all.filter((e) => e.line === line && e.date.slice(0, 7) === monthPrefix && e.date <= uptoDateStr &&
     (!baseline.date || e.date > baseline.date));
-  const byGroup = baselineAppliesThisMonth ? { ...baseline.amounts } : {};
-  let total = baselineAppliesThisMonth ? (baseline.total || 0) : baseline.date ? 0 : (baseline.total || 0);
+  const byGroup = baselineApplies ? { ...baseline.amounts } : {};
+  let total = baselineApplies ? (baseline.total || 0) : 0;
   for (const e of logs) {
     total += e.totalToday || 0;
     (e.rows || []).forEach((r) => { byGroup[r.groupId] = (byGroup[r.groupId] || 0) + (r.todaySale || 0); });
@@ -339,6 +341,12 @@ const DEFAULT_REPORT_STYLE = {
   columnLabels: { product: "کالا", target: "هدف ماه", today: "فروش امروز", cumulative: "فروش از ابتدای ماه", remaining: "مانده تا هدف" },
   columnAlign: { product: "right", target: "center", today: "center", cumulative: "center", remaining: "center" },
   columnBold: { product: true, target: false, today: false, cumulative: false, remaining: false },
+  // per-column background override (applies to that column's data-row + total-row cells);
+  // columnBgEnabled[key]=false means "use the row's own background" (dataRowBg/totalRowBg)
+  columnBgEnabled: { product: false, target: false, today: false, cumulative: false, remaining: false },
+  columnBg: { product: "#ffffff", target: "#ffffff", today: "#ffffff", cumulative: "#ffffff", remaining: "#ffffff" },
+  imageWidth: 660,
+  borderWidth: 1,
   // right-to-left display order + relative width + editable label for the footer stats row
   footerOrder: ["customer", "perRep", "invalid"],
   footerWeights: { customer: 2, perRep: 1, invalid: 2 },
@@ -384,6 +392,8 @@ function sanitizeReportStyle(raw) {
   s.columnLabels = { ...DEFAULT_REPORT_STYLE.columnLabels, ...(raw?.columnLabels || {}) };
   s.columnAlign = { ...DEFAULT_REPORT_STYLE.columnAlign, ...(raw?.columnAlign || {}) };
   s.columnBold = { ...DEFAULT_REPORT_STYLE.columnBold, ...(raw?.columnBold || {}) };
+  s.columnBgEnabled = { ...DEFAULT_REPORT_STYLE.columnBgEnabled, ...(raw?.columnBgEnabled || {}) };
+  s.columnBg = { ...DEFAULT_REPORT_STYLE.columnBg, ...(raw?.columnBg || {}) };
   s.columnOrder = Array.isArray(raw?.columnOrder) && REPORT_COLUMN_KEYS.every((k) => raw.columnOrder.includes(k)) && raw.columnOrder.length === REPORT_COLUMN_KEYS.length
     ? raw.columnOrder
     : [...DEFAULT_REPORT_STYLE.columnOrder];
@@ -1110,7 +1120,7 @@ function renderTargetsTab() {
         <div class="order-item table-row-total" style="cursor:default">
           <span class="name">مجموع هدف ${lineKey === "line1" ? "لاین یک" : "لاین دو"}</span>
           <input type="number" min="0" step="1" id="target-total-${lineKey}" style="width:120px"
-            value="${state.targetTotals[lineKey] || ""}" placeholder="مجموع هدف" />
+            value="${state.targetTotals[lineKey] != null ? state.targetTotals[lineKey] : ""}" placeholder="مجموع هدف" />
         </div>
       </div>`;
   });
@@ -1260,7 +1270,7 @@ async function renderBaselineTab() {
         <div class="order-item table-row-total" style="cursor:default">
           <span class="name">مجموع فروش تا تاریخ — ${lineKey === "line1" ? "لاین یک" : "لاین دو"}</span>
           <input type="number" min="0" step="1" class="baseline-total-input" data-line="${lineKey}" style="width:130px"
-            value="${computed.total || ""}" placeholder="مجموع" />
+            value="${computed.total != null ? computed.total : ""}" placeholder="مجموع" />
         </div>
       </div>
       <div class="row" style="margin-top: var(--space-4); flex-wrap:wrap">
@@ -1452,8 +1462,16 @@ function renderReportStyleForm() {
       ).join("")}
     </div>
 
-    <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب، عرض، چینش و بولد</div>
-    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره یا دکمه‌های بالا/پایین ترتیب نمایش (راست به چپ) را عوض کنید؛ برچسب، عرض، چینش متن و بولد هر ستون هم قابل ویرایش است (هم برای هدر و هم برای ردیف‌های داده و جمع همان ستون).</div>
+    <div class="settings-subhead">اندازه کلی تصویر و خطوط</div>
+    <div class="form-grid">
+      <div class="field"><label>عرض کل تصویر (px)</label>
+        <input type="number" class="style-input" data-style-key="imageWidth" min="300" max="1400" value="${S.imageWidth}" /></div>
+      <div class="field"><label>ضخامت خط جدول (px)</label>
+        <input type="number" class="style-input" data-style-key="borderWidth" min="1" max="6" value="${S.borderWidth}" /></div>
+    </div>
+
+    <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب، عرض، چینش، بولد و رنگ پس‌زمینه</div>
+    <div class="field-hint" style="margin-bottom:var(--space-3)">با دستگیره یا دکمه‌های بالا/پایین ترتیب نمایش (راست به چپ) را عوض کنید؛ برچسب، عرض، چینش متن، بولد و رنگ پس‌زمینه اختصاصی هر ستون هم قابل ویرایش است (هم برای هدر و هم برای ردیف‌های داده و جمع همان ستون — مثلاً ستون «کالا» از شوینده تا مجموع).</div>
     <div id="column-order-slot"></div>
 
     <div class="settings-subhead">ردیف پایین (مشتری/سرانه/ابطالی) — ترتیب، برچسب و عرض</div>
@@ -1504,6 +1522,8 @@ function renderColumnOrderList() {
         </select>
         <input type="number" class="style-input-colw" data-col-key="${key}" min="1" value="${S.columnWeights[key]}" style="width:64px" title="عرض نسبی" />
         <label class="checkbox-label" style="white-space:nowrap"><input type="checkbox" class="style-input-colbold" data-col-key="${key}" ${S.columnBold[key] ? "checked" : ""} /> بولد</label>
+        <label class="checkbox-label" style="white-space:nowrap"><input type="checkbox" class="style-input-colbgenabled" data-col-key="${key}" ${S.columnBgEnabled[key] ? "checked" : ""} /> رنگ اختصاصی</label>
+        <input type="color" class="style-input-colbg" data-col-key="${key}" value="${S.columnBg[key]}" style="width:44px;height:36px;padding:2px" title="رنگ پس‌زمینه این ستون (وقتی «رنگ اختصاصی» فعال باشد)" />
         <div class="move-btns">
           <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="up" data-col-key="${key}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
           <button type="button" class="btn btn-icon btn-sm btn-secondary" data-col-move="down" data-col-key="${key}" ${idx === pendingColumnOrder.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
@@ -1606,7 +1626,7 @@ function collectReportStyleFormValues() {
   const s = { ...state.reportStyle };
   $all(".style-input", slot).forEach((input) => {
     const key = input.dataset.styleKey;
-    const isNumberField = key.endsWith("Size");
+    const isNumberField = key.endsWith("Size") || key === "imageWidth" || key === "borderWidth";
     s[key] = isNumberField ? Number(input.value) || state.reportStyle[key] : input.value;
   });
   $all(".style-input-bold", slot).forEach((input) => {
@@ -1618,6 +1638,8 @@ function collectReportStyleFormValues() {
   const columnLabels = { ...state.reportStyle.columnLabels };
   const columnAlign = { ...state.reportStyle.columnAlign };
   const columnBold = { ...state.reportStyle.columnBold };
+  const columnBgEnabled = { ...state.reportStyle.columnBgEnabled };
+  const columnBg = { ...state.reportStyle.columnBg };
   $all(".style-input-colw", slot).forEach((input) => {
     const v = Number(input.value);
     if (v > 0) columnWeights[input.dataset.colKey] = v;
@@ -1631,10 +1653,18 @@ function collectReportStyleFormValues() {
   $all(".style-input-colbold", slot).forEach((input) => {
     columnBold[input.dataset.colKey] = input.checked;
   });
+  $all(".style-input-colbgenabled", slot).forEach((input) => {
+    columnBgEnabled[input.dataset.colKey] = input.checked;
+  });
+  $all(".style-input-colbg", slot).forEach((input) => {
+    columnBg[input.dataset.colKey] = input.value;
+  });
   s.columnWeights = columnWeights;
   s.columnLabels = columnLabels;
   s.columnAlign = columnAlign;
   s.columnBold = columnBold;
+  s.columnBgEnabled = columnBgEnabled;
+  s.columnBg = columnBg;
 
   s.footerOrder = [...pendingFooterOrder];
   const footerWeights = { ...state.reportStyle.footerWeights };
@@ -1687,10 +1717,10 @@ async function handleResetReportStyle() {
 /* ---------------------------------------------------------
    9b. پشتیبان‌گیری — export / import all groups, products, and settings
    --------------------------------------------------------- */
-function handleExportBackup() {
+async function handleExportBackup() {
   const payload = {
     app: "SalesFlow",
-    backupVersion: 1,
+    backupVersion: 2,
     exportedAt: new Date().toISOString(),
     groups: state.groups,
     products: state.products,
@@ -1698,6 +1728,13 @@ function handleExportBackup() {
     lines: state.lines,
     lineGroups: state.lineGroups,
     fontScale: state.fontScale,
+    // SalesFlow نسخه ۲
+    monthlyTargets: state.monthlyTargets,
+    targetTotals: state.targetTotals,
+    sellersCount: state.sellersCount,
+    monthBaseline: state.monthBaseline,
+    reportStyle: state.reportStyle,
+    salesLog: await Store.getAll("salesLog"),
   };
   const json = JSON.stringify(payload, null, 2);
   const blob = new Blob([json], { type: "application/json" });
@@ -1741,6 +1778,7 @@ async function handleImportBackupFile(file) {
     await Store.clear("groups");
     await Store.clear("products");
     await Store.clear("settings");
+    await Store.clear("salesLog");
 
     for (const g of payload.groups) await Store.put("groups", g);
     for (const p of payload.products) await Store.put("products", p);
@@ -1748,6 +1786,15 @@ async function handleImportBackupFile(file) {
     if (payload.lines) await setSetting("lines", payload.lines);
     if (payload.lineGroups) await setSetting("lineGroups", payload.lineGroups);
     if (payload.fontScale) await setSetting("fontScale", payload.fontScale);
+    // SalesFlow نسخه ۲
+    if (payload.monthlyTargets) await setSetting("monthlyTargets", payload.monthlyTargets);
+    if (payload.targetTotals) await setSetting("targetTotals", payload.targetTotals);
+    if (payload.sellersCount) await setSetting("sellersCount", payload.sellersCount);
+    if (payload.monthBaseline) await setSetting("monthBaseline", payload.monthBaseline);
+    if (payload.reportStyle) await setSetting("reportStyle", payload.reportStyle);
+    if (Array.isArray(payload.salesLog)) {
+      for (const entry of payload.salesLog) await Store.put("salesLog", entry);
+    }
 
     await hydrateState();
     document.documentElement.style.setProperty("--font-scale", String(state.fontScale));
@@ -1759,6 +1806,10 @@ async function handleImportBackupFile(file) {
     loadSettingsFormFromState();
     populateSingleReportSelectors();
     handleRemoveSalesFile();
+    renderTargetsTab();
+    renderBaselineTab();
+    loadSellersFormFromState();
+    renderReportStyleForm();
 
     showToast("بازیابی با موفقیت انجام شد", "success");
   } catch (err) {
@@ -2329,7 +2380,7 @@ function computeColumnBoundsRTL(weights, canvasWidth) {
  * restriction that an SVG/foreignObject round-trip runs into. */
 async function drawReportCanvas(data, S) {
   const scale = 2; // export at 2x for crisp screenshots
-  const widthCss = 660;
+  const widthCss = S.imageWidth || 660;
   const rowH = S.rowHeights;
   const heightCss = rowH.title + rowH.header + data.rows.length * rowH.data + rowH.total + rowH.spacer + rowH.footer;
 
@@ -2360,8 +2411,9 @@ async function drawReportCanvas(data, S) {
     ctx.fillStyle = bg;
     ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
     ctx.strokeStyle = S.borderColor;
-    ctx.lineWidth = 1;
-    ctx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0 - 1, y1 - y0 - 1);
+    ctx.lineWidth = S.borderWidth || 1;
+    const half = (S.borderWidth || 1) / 2;
+    ctx.strokeRect(x0 + half, y0 + half, x1 - x0 - half * 2, y1 - y0 - half * 2);
   }
   /** align: "right" | "center" | "left" — physical, independent of ctx.direction. */
   function text(str, b, y, size, color, bold, family, align, numeric) {
@@ -2373,6 +2425,11 @@ async function drawReportCanvas(data, S) {
     const x = align === "right" ? b.x1 - pad : align === "left" ? b.x0 + pad : (b.x0 + b.x1) / 2;
     ctx.fillText(String(str), x, y, b.w - pad * 2);
     ctx.direction = "rtl";
+  }
+  /** The background for a data/total-row cell: the column's own override
+   * color if enabled, otherwise the row-type's default background. */
+  function colBg(key, rowDefaultBg) {
+    return S.columnBgEnabled[key] ? S.columnBg[key] : rowDefaultBg;
   }
 
   let y = 0;
@@ -2389,7 +2446,7 @@ async function drawReportCanvas(data, S) {
   // ---- column header row (alignment follows the column's own align) ----
   S.columnOrder.forEach((key) => {
     const b = colBoundsByKey[key];
-    cell(b.x0, b.x1, y, y + rowH.header, S.headerRowBg);
+    cell(b.x0, b.x1, y, y + rowH.header, colBg(key, S.headerRowBg));
     text(S.columnLabels[key], b, y + rowH.header / 2, S.headerSize, S.headerRowText, S.headerBold, S.headerFontFamily, S.columnAlign[key], false);
   });
   y += rowH.header;
@@ -2406,7 +2463,7 @@ async function drawReportCanvas(data, S) {
     };
     S.columnOrder.forEach((key) => {
       const b = colBoundsByKey[key];
-      cell(b.x0, b.x1, y, y + rowH.data, S.dataRowBg);
+      cell(b.x0, b.x1, y, y + rowH.data, colBg(key, S.dataRowBg));
       const color = key === "remaining" ? (r.remaining == null ? S.dataRowText : r.remaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.dataRowText;
       text(valuesByKey[key], b, y + rowH.data / 2, S.bodySize, color, S.columnBold[key], S.bodyFontFamily, S.columnAlign[key], key !== "product");
     });
@@ -2424,7 +2481,7 @@ async function drawReportCanvas(data, S) {
     };
     S.columnOrder.forEach((key) => {
       const b = colBoundsByKey[key];
-      cell(b.x0, b.x1, y, y + rowH.total, S.totalRowBg);
+      cell(b.x0, b.x1, y, y + rowH.total, colBg(key, S.totalRowBg));
       const color = key === "remaining" ? (data.totalRemaining < 0 ? S.remainingNegativeText : S.remainingPositiveText) : S.totalRowText;
       text(valuesByKey[key], b, y + rowH.total / 2, S.bodySize, color, true, S.bodyFontFamily, S.columnAlign[key], key !== "product");
     });
@@ -2437,15 +2494,15 @@ async function drawReportCanvas(data, S) {
 
   // ---- footer stats row — order/labels/widths from S.footerOrder ----
   {
-    const invalidDisplay = data.invalidPct ? `${toPersianDigits(data.invalidPct)}٪` : "—";
-    const perRepDisplay = data.perRep != null ? toPersianDigits(data.perRep.toFixed(1)) : "—";
+    const invalidDisplay = data.invalidPct ? `${toPersianDigits(data.invalidPct)}٪` : "";
+    const perRepDisplay = data.perRep != null ? toPersianDigits(data.perRep.toFixed(1)) : "";
     const valuesByKey = { customer: toPersianDigits(data.customerCount), perRep: perRepDisplay, invalid: invalidDisplay };
     const bgByKey = { customer: S.footerCustomerBg, perRep: S.footerPerRepBg, invalid: S.footerInvalidBg };
     const textColorByKey = { customer: S.footerCustomerText, perRep: S.footerPerRepText, invalid: S.footerInvalidText };
     S.footerOrder.forEach((key) => {
       const b = footerBoundsByKey[key];
       cell(b.x0, b.x1, y, y + rowH.footer, bgByKey[key]);
-      const label = `${S.footerLabels[key]}: ${valuesByKey[key]}`;
+      const label = valuesByKey[key] ? `${S.footerLabels[key]}: ${valuesByKey[key]}` : `${S.footerLabels[key]}:`;
       text(label, b, y + rowH.footer / 2, key === "perRep" ? Math.max(11, S.footerSize - 2) : S.footerSize, textColorByKey[key], S.footerBold, S.footerFontFamily, "center", false);
     });
   }
