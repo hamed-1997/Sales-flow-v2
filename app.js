@@ -347,6 +347,7 @@ const DEFAULT_REPORT_STYLE = {
   columnBg: { product: "#ffffff", target: "#ffffff", today: "#ffffff", cumulative: "#ffffff", remaining: "#ffffff" },
   imageWidth: 660,
   borderWidth: 1,
+  dateCellSpan: 1, // how many of the rightmost-columns' worth of width the date cell (top-left) takes up — default = just the last column
   // right-to-left display order + relative width + editable label for the footer stats row
   footerOrder: ["customer", "perRep", "invalid"],
   footerWeights: { customer: 2, perRep: 1, invalid: 2 },
@@ -442,7 +443,7 @@ const state = {
   monthlyTargets: { line1: {}, line2: {} },  // { line1: {groupId: number}, line2: {...} }
   targetTotals: { line1: 0, line2: 0 },       // separately-announced total target per line
   sellersCount: { line1: 0, line2: 0 },
-  monthBaseline: {                             // فروش تا روز قبل — مبدأ تجمعی ماه، به‌تفکیک گروه کالا
+  monthBaseline: {                             // گزارش فروش تا روز — مبدأ تجمعی ماه، به‌تفکیک گروه کالا
     line1: { date: "", amounts: {}, total: 0 },
     line2: { date: "", amounts: {}, total: 0 },
   },
@@ -997,10 +998,11 @@ function renderLineOrderList(lineKey, globalSorted) {
     ? `<div class="order-list" data-line-order-list="${lineKey}">${selectedGroups
         .map(
           (g, idx) => `
-          <div class="order-item" draggable="true" data-line="${lineKey}" data-group-id="${g.id}">
+          <div class="order-item order-item-wrap" draggable="true" data-line="${lineKey}" data-group-id="${g.id}">
             <span class="drag-handle"><svg width="16" height="16"><use href="#icon-grip"></use></svg></span>
             <input type="checkbox" data-line-toggle="${lineKey}" data-group-id="${g.id}" checked />
             <span class="name">${escapeHtml(g.name)}</span>
+            <input type="text" class="group-display-name-input" data-group-id="${g.id}" value="${escapeHtml(g.displayName || "")}" placeholder="نام نمایشی در گزارش (اختیاری)" style="width:180px" />
             <div class="move-btns">
               <button class="btn btn-icon btn-sm btn-secondary" data-line-move="up" data-line="${lineKey}" data-group-id="${g.id}" ${idx === 0 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-up"></use></svg></button>
               <button class="btn btn-icon btn-sm btn-secondary" data-line-move="down" data-line="${lineKey}" data-group-id="${g.id}" ${idx === selectedGroups.length - 1 ? "disabled" : ""}><svg width="14" height="14"><use href="#icon-chevron-down"></use></svg></button>
@@ -1086,6 +1088,21 @@ function renderLineOrderList(lineKey, globalSorted) {
 async function handleSaveLineGroups(lineKey) {
   state.lineGroups[lineKey] = [...pendingLineOrder[lineKey]];
   await setSetting("lineGroups", state.lineGroups);
+
+  // persist any edited "نام نمایشی در گزارش" values for this line's groups
+  const slot = $(`#${lineKey}-groups-slot`);
+  const nameInputs = slot ? $all(".group-display-name-input", slot) : [];
+  for (const input of nameInputs) {
+    const gid = Number(input.dataset.groupId);
+    const g = groupById(gid);
+    if (!g) continue;
+    const newName = input.value.trim();
+    if ((g.displayName || "") !== newName) {
+      g.displayName = newName;
+      await Store.put("groups", g);
+    }
+  }
+
   showToast(`تنظیمات ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
   renderTargetsTab(); // group selection changed — target rows follow it
   renderBaselineTab(); // ditto — baseline rows follow the same group selection
@@ -1226,7 +1243,7 @@ async function handleSaveSellers() {
 }
 
 /* ---------------------------------------------------------
-   9d. مدیریت › فروش تا روز قبل — مبدأ تجمعی، به‌تفکیک گروه کالا
+   9d. مدیریت › گزارش فروش تا روز — مبدأ تجمعی، به‌تفکیک گروه کالا
    --------------------------------------------------------- */
 /** For prefilling the form: what the app currently computes as each line's
  * cumulative-through-yesterday (using whatever baseline + saved daily logs
@@ -1246,7 +1263,7 @@ async function renderBaselineTab() {
     const computed = await getMonthCumulativeRows(lineKey, computedThroughDate);
     slot.innerHTML = `
       <div class="field-hint" style="margin-bottom:var(--space-3)">
-        مقادیر پایین، «فروش تا ${escapeHtml(toPersianDigits(computedThroughDate))}» است — همان چیزی که الان محاسبه شده؛ هر عددی را می‌توانید دستی اصلاح کنید.
+        این عدد‌ها همیشه خودکار «تا ${escapeHtml(toPersianDigits(computedThroughDate))}» به‌روز است — هر بار «ذخیره فروش روز» را در گزارش‌گیری بزنید، همین‌جا هم خودش جلو می‌رود. هر عددی را هم می‌توانید همین‌جا دستی اصلاح و ذخیره کنید (مثلاً برای شروع ماه جدید یا شروع از وسط ماه).
       </div>
       <div class="field" style="margin-bottom:var(--space-4)">
         <label>فروش تا تاریخ (خالی = ابتدای ماه / صفر)</label>
@@ -1359,7 +1376,7 @@ async function handleSaveBaselineLine(lineKey) {
   const total = toPersianSafeNumber(totalInput ? totalInput.value : "");
   state.monthBaseline[lineKey] = { date, amounts, total: isNaN(total) ? 0 : total };
   await setSetting("monthBaseline", state.monthBaseline);
-  showToast(`فروش تا روز قبل — ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
+  showToast(`گزارش فروش تا روز — ${lineKey === "line1" ? "لاین یک" : "لاین دو"} ذخیره شد`, "success");
   renderBaselineTab();
 }
 
@@ -1467,7 +1484,9 @@ function renderReportStyleForm() {
       <div class="field"><label>عرض کل تصویر (px)</label>
         <input type="number" class="style-input" data-style-key="imageWidth" min="300" max="1400" value="${S.imageWidth}" /></div>
       <div class="field"><label>ضخامت خط جدول (px)</label>
-        <input type="number" class="style-input" data-style-key="borderWidth" min="1" max="6" value="${S.borderWidth}" /></div>
+        <input type="number" class="style-input" data-style-key="borderWidth" min="0.5" max="6" step="0.5" value="${S.borderWidth}" /></div>
+      <div class="field"><label>تعداد ستون زیر سلول تاریخ</label>
+        <input type="number" class="style-input" data-style-key="dateCellSpan" min="1" max="4" value="${S.dateCellSpan}" /></div>
     </div>
 
     <div class="settings-subhead">ستون‌های جدول — ترتیب، برچسب، عرض، چینش، بولد و رنگ پس‌زمینه</div>
@@ -1626,7 +1645,7 @@ function collectReportStyleFormValues() {
   const s = { ...state.reportStyle };
   $all(".style-input", slot).forEach((input) => {
     const key = input.dataset.styleKey;
-    const isNumberField = key.endsWith("Size") || key === "imageWidth" || key === "borderWidth";
+    const isNumberField = key.endsWith("Size") || key === "imageWidth" || key === "borderWidth" || key === "dateCellSpan";
     s[key] = isNumberField ? Number(input.value) || state.reportStyle[key] : input.value;
   });
   $all(".style-input-bold", slot).forEach((input) => {
@@ -2026,7 +2045,7 @@ function buildLineReportRows(groupSumsDisplay, groupSumsCartonEquivalent, select
     .filter(Boolean)
     .map((g) => {
       const exact = groupSumsDisplay[g.id] || 0;
-      return { groupId: g.id, name: g.name, exact, rounded: Math.round(exact), sellByUnit: !!g.sellByUnit };
+      return { groupId: g.id, name: g.displayName || g.name, exact, rounded: Math.round(exact), sellByUnit: !!g.sellByUnit };
     });
   const totalExact = Object.values(groupSumsCartonEquivalent).reduce((sum, v) => sum + v, 0);
   const totalRounded = Math.round(totalExact);
@@ -2435,8 +2454,10 @@ async function drawReportCanvas(data, S) {
   let y = 0;
 
   // ---- title row: rightmost 3 column-slots = report title, leftmost 2 = date ----
-  const titleB = { x0: bounds[2].x0, x1: bounds[0].x1, w: bounds[0].x1 - bounds[2].x0 };
-  const dateB = { x0: bounds[4].x0, x1: bounds[3].x1, w: bounds[3].x1 - bounds[4].x0 };
+  const n = S.columnOrder.length;
+  const span = Math.min(Math.max(S.dateCellSpan || 1, 1), n - 1);
+  const titleB = { x0: bounds[n - 1 - span].x0, x1: bounds[0].x1, w: bounds[0].x1 - bounds[n - 1 - span].x0 };
+  const dateB = { x0: bounds[n - 1].x0, x1: bounds[n - span].x1, w: bounds[n - span].x1 - bounds[n - 1].x0 };
   cell(titleB.x0, titleB.x1, y, y + rowH.title, S.titleCellBg);
   cell(dateB.x0, dateB.x1, y, y + rowH.title, S.dateCellBg);
   text(S.titleTemplate.replace("{line}", data.lineLabel), titleB, y + rowH.title / 2, S.titleSize, S.titleCellText, S.titleBold, S.titleFontFamily, "center", false);
@@ -2625,7 +2646,17 @@ async function handleSaveDailySale() {
     const rd = results[lineKey];
     await saveDailySaleFull(dateStr, lineKey, rd.rows, rd.totalToday);
   }
-  showToast(`فروش روز ${toPersianDigits(dateStr)} در مخزن فروش ذخیره شد`, "success");
+  // roll «گزارش فروش تا روز» forward: after saving, it should read as "through
+  // today" — reuse the same (already-correct) cumulative computation, now
+  // that today's entry is logged, and persist it as the new baseline so the
+  // management tab reflects it immediately without the user re-entering anything.
+  for (const lineKey of ["line1", "line2"]) {
+    const cum = await getMonthCumulativeRows(lineKey, dateStr);
+    state.monthBaseline[lineKey] = { date: dateStr, amounts: cum.byGroup, total: cum.total };
+  }
+  await setSetting("monthBaseline", state.monthBaseline);
+  renderBaselineTab();
+  showToast(`فروش روز ${toPersianDigits(dateStr)} ذخیره شد و «گزارش فروش تا روز» به‌روز شد`, "success");
 }
 
 /* ----- گزارش تکی ----- */
