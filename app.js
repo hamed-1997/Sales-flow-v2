@@ -448,6 +448,7 @@ const state = {
     line2: { date: "", amounts: {}, total: 0 },
   },
   reportStyle: { ...DEFAULT_REPORT_STYLE },
+  appLockPinHash: "",
 };
 
 async function hydrateState() {
@@ -469,6 +470,7 @@ async function hydrateState() {
     line2: { date: rawBaseline?.line2?.date || "", amounts: rawBaseline?.line2?.amounts || {}, total: rawBaseline?.line2?.total ?? rawBaseline?.line2?.amount ?? 0 },
   };
   state.reportStyle = sanitizeReportStyle(await getSetting("reportStyle", {}));
+  state.appLockPinHash = await getSetting("appLockPinHash", "");
 }
 
 function groupById(id) { return state.groups.find((g) => g.id === id); }
@@ -2813,8 +2815,120 @@ function bindSettingsView() {
   $("#btn-reset-report-style").addEventListener("click", handleResetReportStyle);
 }
 
+/* ---------------------------------------------------------
+   0c. قفل برنامه (اختیاری) — یک صفحه‌ی قفل ساده، نه رمزنگاری واقعی؛
+   فقط جلوی باز کردن سرسری اپ توسط دیگران را می‌گیرد.
+   --------------------------------------------------------- */
+async function sha256Hex(text) {
+  const enc = new TextEncoder().encode(text);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Blocks app rendering behind a PIN prompt if one is set — resolves once
+ * unlocked (or immediately if no PIN is configured). */
+async function checkAppLock() {
+  if (!state.appLockPinHash) {
+    document.body.classList.remove("sf-boot");
+    return;
+  }
+  const overlay = $("#app-lock-overlay");
+  const input = $("#app-lock-input");
+  const errorEl = $("#app-lock-error");
+  overlay.style.display = "flex";
+  document.body.classList.remove("sf-boot");
+  input.focus();
+
+  await new Promise((resolve) => {
+    async function tryUnlock() {
+      const val = input.value;
+      if (!val) return;
+      const hash = await sha256Hex(val);
+      if (hash === state.appLockPinHash) {
+        overlay.style.display = "none";
+        input.value = "";
+        errorEl.style.display = "none";
+        resolve();
+      } else {
+        errorEl.style.display = "block";
+        input.value = "";
+        input.focus();
+      }
+    }
+    $("#app-lock-submit").addEventListener("click", tryUnlock);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") tryUnlock(); });
+  });
+}
+
+function renderAppLockForm() {
+  const slot = $("#app-lock-form-slot");
+  if (!slot) return;
+  if (!state.appLockPinHash) {
+    slot.innerHTML = `
+      <div class="field-hint" style="margin-bottom:var(--space-3)">هنوز رمزی تنظیم نشده — هر کسی اپ را باز کند مستقیم واردش می‌شود.</div>
+      <div class="form-grid">
+        <div class="field"><label>رمز جدید (حداقل ۴ رقم/کاراکتر)</label><input type="password" id="lock-new-pin" autocomplete="off" /></div>
+        <div class="field"><label>تکرار رمز</label><input type="password" id="lock-new-pin-confirm" autocomplete="off" /></div>
+      </div>
+      <div class="row" style="margin-top:var(--space-4)">
+        <button class="btn btn-primary" id="btn-set-app-lock">${icon("lock")} فعال کردن قفل</button>
+      </div>`;
+    $("#btn-set-app-lock").addEventListener("click", handleSetAppLock);
+  } else {
+    slot.innerHTML = `
+      <div class="field-hint" style="margin-bottom:var(--space-3)">قفل روشن است. برای تغییر یا حذف رمز، اول رمز فعلی را وارد کنید.</div>
+      <div class="form-grid">
+        <div class="field"><label>رمز فعلی</label><input type="password" id="lock-current-pin" autocomplete="off" /></div>
+        <div class="field"><label>رمز جدید (برای حذف قفل، خالی بگذارید)</label><input type="password" id="lock-new-pin" autocomplete="off" /></div>
+      </div>
+      <div class="row" style="margin-top:var(--space-4); flex-wrap:wrap">
+        <button class="btn btn-primary" id="btn-change-app-lock">${icon("save")} ذخیره تغییر رمز</button>
+        <button class="btn btn-secondary" id="btn-remove-app-lock">${icon("trash")} حذف قفل</button>
+        <button class="btn btn-secondary" id="btn-lock-now">${icon("lock")} قفل کردن الان</button>
+      </div>`;
+    $("#btn-change-app-lock").addEventListener("click", handleChangeAppLock);
+    $("#btn-remove-app-lock").addEventListener("click", handleRemoveAppLock);
+    $("#btn-lock-now").addEventListener("click", () => location.reload());
+  }
+}
+
+async function handleSetAppLock() {
+  const pin = $("#lock-new-pin").value;
+  const confirm = $("#lock-new-pin-confirm").value;
+  if (pin.length < 4) { showToast("رمز باید حداقل ۴ رقم/کاراکتر باشد", "error"); return; }
+  if (pin !== confirm) { showToast("رمز و تکرارش یکی نیستند", "error"); return; }
+  state.appLockPinHash = await sha256Hex(pin);
+  await setSetting("appLockPinHash", state.appLockPinHash);
+  showToast("قفل فعال شد", "success");
+  renderAppLockForm();
+}
+
+async function handleChangeAppLock() {
+  const current = $("#lock-current-pin").value;
+  const newPin = $("#lock-new-pin").value;
+  const currentHash = await sha256Hex(current || "");
+  if (currentHash !== state.appLockPinHash) { showToast("رمز فعلی اشتباه است", "error"); return; }
+  if (!newPin) { showToast("برای حذف قفل، از دکمه «حذف قفل» استفاده کنید", "error"); return; }
+  if (newPin.length < 4) { showToast("رمز جدید باید حداقل ۴ رقم/کاراکتر باشد", "error"); return; }
+  state.appLockPinHash = await sha256Hex(newPin);
+  await setSetting("appLockPinHash", state.appLockPinHash);
+  showToast("رمز تغییر کرد", "success");
+  renderAppLockForm();
+}
+
+async function handleRemoveAppLock() {
+  const current = $("#lock-current-pin").value;
+  const currentHash = await sha256Hex(current || "");
+  if (currentHash !== state.appLockPinHash) { showToast("رمز فعلی اشتباه است", "error"); return; }
+  state.appLockPinHash = "";
+  await setSetting("appLockPinHash", "");
+  showToast("قفل حذف شد", "success");
+  renderAppLockForm();
+}
+
 async function init() {
   await hydrateState();
+  await checkAppLock();
   document.documentElement.style.setProperty("--font-scale", String(state.fontScale));
 
   renderGroupAddForm();
@@ -2829,6 +2943,7 @@ async function init() {
   loadSellersFormFromState();
   renderBaselineTab();
   renderReportStyleForm();
+  renderAppLockForm();
 
   bindNavigation();
   bindReportsView();
@@ -2836,8 +2951,34 @@ async function init() {
   bindSettingsView();
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (hadController) showUpdateBanner();
+    });
+    navigator.serviceWorker
+      .register("sw.js")
+      .then((reg) => {
+        // check for a newer sw.js periodically while the app stays open
+        // (GitHub Pages/browser HTTP caching would otherwise delay this)
+        setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
+      })
+      .catch(() => {});
   }
+}
+
+/** Shows a small persistent bar prompting the user to reload once a newer
+ * deployed version has taken over as the active service worker — this is
+ * how "update the app" works for a GitHub-Pages-hosted PWA with no server
+ * to push notifications from. */
+function showUpdateBanner() {
+  if ($("#update-banner")) return;
+  const bar = document.createElement("div");
+  bar.id = "update-banner";
+  bar.innerHTML = `
+    <span>${icon("upload-cloud")} نسخه‌ی جدید SalesFlow آماده است</span>
+    <button id="btn-update-now" class="btn btn-primary btn-sm">بروزرسانی</button>`;
+  document.body.appendChild(bar);
+  $("#btn-update-now").addEventListener("click", () => location.reload());
 }
 
 document.addEventListener("DOMContentLoaded", init);

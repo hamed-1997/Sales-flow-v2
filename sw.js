@@ -3,7 +3,7 @@
    by their fixed filenames (assets/icon-192.png, icon-512.png,
    favicon.png) — replacing their content later requires no change here. */
 
-const CACHE_VERSION = "salesflow-v11";
+const CACHE_VERSION = "salesflow-v12";
 const CORE_ASSETS = [
   "./",
   "./index.html",
