@@ -449,6 +449,7 @@ const state = {
   },
   reportStyle: { ...DEFAULT_REPORT_STYLE },
   appLockPinHash: "",
+  lastBackupAt: "",
 };
 
 async function hydrateState() {
@@ -471,6 +472,7 @@ async function hydrateState() {
   };
   state.reportStyle = sanitizeReportStyle(await getSetting("reportStyle", {}));
   state.appLockPinHash = await getSetting("appLockPinHash", "");
+  state.lastBackupAt = await getSetting("lastBackupAt", "");
 }
 
 function groupById(id) { return state.groups.find((g) => g.id === id); }
@@ -1250,6 +1252,18 @@ async function handleSaveSellers() {
 /** For prefilling the form: what the app currently computes as each line's
  * cumulative-through-yesterday (using whatever baseline + saved daily logs
  * already exist) — a convenient starting point the user can then edit. */
+/** The most recent Shamsi date this line has an actual saved daily entry
+ * for, or null if none yet — used to keep گزارش فروش تا روز showing live,
+ * current totals without ever mutating the baseline itself (which stays a
+ * fixed origin point, so editing/deleting an old day in تاریخچه always
+ * recomputes correctly). */
+async function getLatestSalesLogDate(line) {
+  const all = await Store.getAll("salesLog");
+  const dates = all.filter((e) => e.line === line).map((e) => e.date);
+  if (!dates.length) return null;
+  return dates.reduce((a, b) => (a > b ? a : b));
+}
+
 async function renderBaselineTab() {
   for (const lineKey of ["line1", "line2"]) {
     const slot = $(`#baseline-${lineKey}-slot`);
@@ -1261,7 +1275,10 @@ async function renderBaselineTab() {
       continue;
     }
     const b = state.monthBaseline[lineKey] || { date: "", amounts: {}, total: 0 };
-    const computedThroughDate = b.date || yesterdayJalaliStr();
+    const latestLogged = await getLatestSalesLogDate(lineKey);
+    let computedThroughDate = b.date || "";
+    if (latestLogged && (!computedThroughDate || latestLogged > computedThroughDate)) computedThroughDate = latestLogged;
+    if (!computedThroughDate) computedThroughDate = yesterdayJalaliStr();
     const computed = await getMonthCumulativeRows(lineKey, computedThroughDate);
     slot.innerHTML = `
       <div class="field-hint" style="margin-bottom:var(--space-3)">
@@ -1386,6 +1403,111 @@ async function handleClearBaselineLine(lineKey) {
   state.monthBaseline[lineKey] = { date: "", amounts: {}, total: 0 };
   await setSetting("monthBaseline", state.monthBaseline);
   showToast(`${lineKey === "line1" ? "لاین یک" : "لاین دو"} برای ماه جدید صفر شد`, "success");
+  renderBaselineTab();
+}
+
+/* ---------------------------------------------------------
+   9e. مدیریت › تاریخچه فروش — مشاهده/اصلاح/حذف هر روز ذخیره‌شده
+   --------------------------------------------------------- */
+async function renderHistoryTab() {
+  for (const lineKey of ["line1", "line2"]) {
+    const slot = $(`#history-${lineKey}-slot`);
+    if (!slot) continue;
+    const all = await Store.getAll("salesLog");
+    const entries = all.filter((e) => e.line === lineKey).sort((a, b) => (a.date < b.date ? 1 : -1));
+    if (!entries.length) {
+      slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-calendar"></use></svg></div><div class="title">هنوز هیچ روزی ذخیره نشده</div></div>`;
+      continue;
+    }
+    slot.innerHTML = entries
+      .map((e) => {
+        const safeId = e.date.replace(/\//g, "-");
+        return `
+        <div class="history-entry" data-history-line="${lineKey}" data-history-date="${e.date}">
+          <div class="history-entry-row">
+            <span class="history-entry-date">${toPersianDigits(e.date)}</span>
+            <span class="history-entry-total">${toPersianDigits(formatNumber(e.totalToday))}</span>
+            <button type="button" class="btn btn-icon btn-sm btn-secondary" data-history-toggle="${lineKey}-${safeId}" title="مشاهده/اصلاح">
+              <svg width="16" height="16"><use href="#icon-edit"></use></svg>
+            </button>
+            <button type="button" class="btn btn-icon btn-sm btn-secondary" data-history-delete="${lineKey}" data-history-delete-date="${e.date}" title="حذف">
+              <svg width="16" height="16"><use href="#icon-trash"></use></svg>
+            </button>
+          </div>
+          <div class="history-entry-detail" id="history-detail-${lineKey}-${safeId}" style="display:none"></div>
+        </div>`;
+      })
+      .join("");
+  }
+
+  $all("[data-history-toggle]").forEach((btn) => {
+    btn.addEventListener("click", () => toggleHistoryDetail(btn.dataset.historyToggle));
+  });
+  $all("[data-history-delete]").forEach((btn) => {
+    btn.addEventListener("click", () => handleDeleteHistoryEntry(btn.dataset.historyDelete, btn.dataset.historyDeleteDate));
+  });
+}
+
+function toggleHistoryDetail(key) {
+  const [lineKey, ...dateParts] = key.split("-");
+  const detail = $(`#history-detail-${key}`);
+  if (!detail) return;
+  const isOpen = detail.style.display !== "none";
+  if (isOpen) { detail.style.display = "none"; detail.innerHTML = ""; return; }
+  const dateStr = dateParts.join("-").replace(/-/g, "/");
+  renderHistoryDetailForm(lineKey, dateStr, detail);
+  detail.style.display = "block";
+}
+
+async function renderHistoryDetailForm(lineKey, dateStr, container) {
+  const entry = await Store.get("salesLog", `${dateStr}__${lineKey}`);
+  if (!entry) { container.innerHTML = `<div class="field-hint">این روز پیدا نشد</div>`; return; }
+  const groups = entry.rows.map((r) => ({ ...r, group: groupById(r.groupId) })).filter((r) => r.group);
+  container.innerHTML = `
+    <div class="order-list">
+      ${groups
+        .map(
+          (r) => `
+        <div class="order-item" style="cursor:default">
+          <span class="name">${escapeHtml(r.group.displayName || r.group.name)}</span>
+          <input type="number" min="0" step="1" class="history-edit-input" data-group="${r.groupId}" value="${r.todaySale}" style="width:120px" />
+        </div>`
+        )
+        .join("")}
+    </div>
+    <div class="row" style="margin-top:var(--space-3)">
+      <button type="button" class="btn btn-primary btn-sm" data-history-save-line="${lineKey}" data-history-save-date="${dateStr}">${icon("save")} ذخیره اصلاحات این روز</button>
+    </div>`;
+  $("[data-history-save-line]", container).addEventListener("click", () => handleSaveHistoryEdit(lineKey, dateStr, container));
+}
+
+async function handleSaveHistoryEdit(lineKey, dateStr, container) {
+  const entry = await Store.get("salesLog", `${dateStr}__${lineKey}`);
+  if (!entry) return;
+  const newRows = entry.rows.map((r) => {
+    const input = $(`.history-edit-input[data-group="${r.groupId}"]`, container);
+    const v = input ? toPersianSafeNumber(input.value) : r.todaySale;
+    return { groupId: r.groupId, todaySale: isNaN(v) ? r.todaySale : v };
+  });
+  const newTotal = newRows.reduce((s, r) => s + (r.todaySale || 0), 0);
+  await saveDailySaleFull(dateStr, lineKey, newRows, newTotal);
+  showToast(`اصلاحات روز ${toPersianDigits(dateStr)} ذخیره شد`, "success");
+  renderHistoryTab();
+  renderBaselineTab();
+}
+
+async function handleDeleteHistoryEntry(lineKey, dateStr) {
+  const ok = await confirmModal({
+    icon: "trash",
+    title: "حذف این روز؟",
+    body: `فروش ثبت‌شده برای ${toPersianDigits(dateStr)} (${lineKey === "line1" ? "لاین یک" : "لاین دو"}) کاملاً حذف می‌شود و دیگر در هیچ محاسبه‌ای شمرده نخواهد شد.`,
+    confirmLabel: "حذف کن",
+  });
+  if (!ok) return;
+  const rec = await Store.get("salesLog", `${dateStr}__${lineKey}`);
+  if (rec) await Store.delete("salesLog", rec.id);
+  showToast(`فروش روز ${toPersianDigits(dateStr)} حذف شد`, "success");
+  renderHistoryTab();
   renderBaselineTab();
 }
 
@@ -1768,6 +1890,10 @@ async function handleExportBackup() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+  state.lastBackupAt = new Date().toISOString();
+  await setSetting("lastBackupAt", state.lastBackupAt);
+  updateBackupStatusText();
+  hideBackupReminderBanner();
   showToast("فایل پشتیبان دانلود شد", "success");
 }
 
@@ -2648,17 +2774,12 @@ async function handleSaveDailySale() {
     const rd = results[lineKey];
     await saveDailySaleFull(dateStr, lineKey, rd.rows, rd.totalToday);
   }
-  // roll «گزارش فروش تا روز» forward: after saving, it should read as "through
-  // today" — reuse the same (already-correct) cumulative computation, now
-  // that today's entry is logged, and persist it as the new baseline so the
-  // management tab reflects it immediately without the user re-entering anything.
-  for (const lineKey of ["line1", "line2"]) {
-    const cum = await getMonthCumulativeRows(lineKey, dateStr);
-    state.monthBaseline[lineKey] = { date: dateStr, amounts: cum.byGroup, total: cum.total };
-  }
-  await setSetting("monthBaseline", state.monthBaseline);
+  // نکته: مبدأ (گزارش فروش تا روز) دیگر عمداً اینجا تغییر داده نمی‌شود —
+  // آن تب حالا خودش زنده تا آخرین روز ثبت‌شده محاسبه می‌کند (نه با جابه‌جا
+  // کردن مبدأ)، تا اصلاح/حذف یک روز قدیمی از تاریخچه همیشه صحیح بماند.
   renderBaselineTab();
-  showToast(`فروش روز ${toPersianDigits(dateStr)} ذخیره شد و «گزارش فروش تا روز» به‌روز شد`, "success");
+  renderHistoryTab();
+  showToast(`فروش روز ${toPersianDigits(dateStr)} ذخیره شد`, "success");
 }
 
 /* ----- گزارش تکی ----- */
@@ -2942,8 +3063,11 @@ async function init() {
   renderTargetsTab();
   loadSellersFormFromState();
   renderBaselineTab();
+  renderHistoryTab();
   renderReportStyleForm();
   renderAppLockForm();
+  updateBackupStatusText();
+  checkBackupReminder();
 
   bindNavigation();
   bindReportsView();
@@ -2977,8 +3101,63 @@ function showUpdateBanner() {
   bar.innerHTML = `
     <span>${icon("upload-cloud")} نسخه‌ی جدید SalesFlow آماده است</span>
     <button id="btn-update-now" class="btn btn-primary btn-sm">بروزرسانی</button>`;
-  document.body.appendChild(bar);
+  document.body.prepend(bar);
   $("#btn-update-now").addEventListener("click", () => location.reload());
+}
+
+/* ---------------------------------------------------------
+   0d. یادآوری پشتیبان‌گیری — همه‌چیز فقط رو همین مرورگر ذخیره می‌شود،
+   پس یادآوری منظم برای گرفتن فایل پشتیبان اهمیت دارد.
+   --------------------------------------------------------- */
+const BACKUP_REMINDER_DAYS = 7;
+
+function daysSince(isoString) {
+  if (!isoString) return Infinity;
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function updateBackupStatusText() {
+  const el = $("#backup-status-text");
+  if (!el) return;
+  if (!state.lastBackupAt) {
+    el.textContent = "هنوز هیچ پشتیبانی گرفته نشده.";
+    return;
+  }
+  const d = daysSince(state.lastBackupAt);
+  el.textContent = d === 0 ? "آخرین پشتیبان: امروز" : d === 1 ? "آخرین پشتیبان: دیروز" : `آخرین پشتیبان: ${d} روز پیش`;
+}
+
+function checkBackupReminder() {
+  if (daysSince(state.lastBackupAt) >= BACKUP_REMINDER_DAYS) showBackupReminderBanner();
+}
+
+/** Inserted as a normal (non-fixed) element right at the top of <body> —
+ * ahead of #app-shell — so it pushes the rest of the page down instead of
+ * floating over it. That's what avoids the earlier bug where a fixed-position
+ * banner sat on top of (and silently ate clicks on) the tab bar underneath it. */
+function showBackupReminderBanner() {
+  if ($("#backup-reminder-banner")) return;
+  const bar = document.createElement("div");
+  bar.id = "backup-reminder-banner";
+  const d = daysSince(state.lastBackupAt);
+  const msg = d === Infinity ? "هنوز هیچ پشتیبانی از این برنامه نگرفته‌اید" : `آخرین پشتیبان‌گیری ${d} روز پیش بوده`;
+  bar.innerHTML = `
+    <span>${icon("alert-triangle")} ${escapeHtml(msg)} — یادت نره!</span>
+    <button id="btn-backup-now" class="btn btn-primary btn-sm">دریافت پشتیبان</button>
+    <button id="btn-dismiss-backup-reminder" class="btn-close-banner" aria-label="بستن">✕</button>`;
+  // sits right after the update banner if one is already showing, so the two
+  // stack in normal document flow (update banner on top) rather than overlapping
+  const updateBar = $("#update-banner");
+  if (updateBar) updateBar.insertAdjacentElement("afterend", bar);
+  else document.body.prepend(bar);
+  $("#btn-backup-now").addEventListener("click", handleExportBackup);
+  $("#btn-dismiss-backup-reminder").addEventListener("click", hideBackupReminderBanner);
+}
+
+function hideBackupReminderBanner() {
+  const bar = $("#backup-reminder-banner");
+  if (bar) bar.remove();
 }
 
 document.addEventListener("DOMContentLoaded", init);
