@@ -663,3 +663,4 @@ body.sf-boot #app-shell > *:not(#app-lock-overlay) { visibility: hidden; }
   font-size: var(--font-size-md); line-height: 1; padding: 4px 8px; opacity: 0.7;
 }
 .btn-close-banner:hover { opacity: 1; }
+.history-summary { background: var(--color-accent-100); color: var(--color-accent-600); border-radius: var(--radius-md); padding: var(--space-3); margin-bottom: var(--space-3); font-size: var(--font-size-sm); font-weight: 600; }

@@ -292,24 +292,27 @@ async function saveDailySaleFull(dateStr, line, rows, totalToday) {
 
 /**
  * Cumulative sale for `line`, from the configured baseline (مدیریت › فروش
- * تا روز قبل) through (and including) `uptoDateStr` — both per
- * product-group and as a line total. If no entry for `uptoDateStr` has been
- * saved yet (e.g. today, before pressing "ذخیره فروش روز"), it's simply not
- * counted yet — callers add today's not-yet-saved amount on top when
- * needed.
+ * تا روز قبل) through `uptoDateStr` — both per product-group and as a line
+ * total. By default this INCLUDES `uptoDateStr` itself (used by تاریخچه/
+ * گزارش فروش تا روز to show "cumulative through this day"). Pass
+ * `exclusive: true` to stop strictly before it instead — this is what
+ * گزارش کامل روز uses so that re-generating/overwriting an already-saved
+ * day doesn't double-count that day's old entry into "cumulative so far"
+ * before adding the new value on top.
  *
- * The baseline now carries a full per-group breakdown (not just a total),
- * so both individual rows and the total row are accurate from the baseline
+ * The baseline carries a full per-group breakdown (not just a total), so
+ * both individual rows and the total row are accurate from the baseline
  * date forward, even when starting mid-month.
  */
-async function getMonthCumulativeRows(line, uptoDateStr) {
+async function getMonthCumulativeRows(line, uptoDateStr, { exclusive = false } = {}) {
   const monthPrefix = uptoDateStr.slice(0, 7); // "YYYY/MM"
   const baseline = state.monthBaseline[line] || { date: "", amounts: {}, total: 0 };
   // An empty date means "start of month" — the baseline always applies (day
   // one onward), not just when its (nonexistent) date matches this month.
   const baselineApplies = !baseline.date || baseline.date.slice(0, 7) === monthPrefix;
   const all = await Store.getAll("salesLog");
-  const logs = all.filter((e) => e.line === line && e.date.slice(0, 7) === monthPrefix && e.date <= uptoDateStr &&
+  const logs = all.filter((e) => e.line === line && e.date.slice(0, 7) === monthPrefix &&
+    (exclusive ? e.date < uptoDateStr : e.date <= uptoDateStr) &&
     (!baseline.date || e.date > baseline.date));
   const byGroup = baselineApplies ? { ...baseline.amounts } : {};
   let total = baselineApplies ? (baseline.total || 0) : 0;
@@ -1419,14 +1422,16 @@ async function renderHistoryTab() {
       slot.innerHTML = `<div class="empty-state"><div class="icon"><svg><use href="#icon-calendar"></use></svg></div><div class="title">هنوز هیچ روزی ذخیره نشده</div></div>`;
       continue;
     }
-    slot.innerHTML = entries
+    const sumLogged = entries.reduce((s, e) => s + (e.totalToday || 0), 0);
+    const summaryHtml = `<div class="history-summary">مجموع فروش ${toPersianDigits(entries.length)} روز ثبت‌شده: <strong>${toPersianDigits(formatNumber(sumLogged))}</strong></div>`;
+    slot.innerHTML = summaryHtml + entries
       .map((e) => {
         const safeId = e.date.replace(/\//g, "-");
         return `
         <div class="history-entry" data-history-line="${lineKey}" data-history-date="${e.date}">
           <div class="history-entry-row">
             <span class="history-entry-date">${toPersianDigits(e.date)}</span>
-            <span class="history-entry-total">${toPersianDigits(formatNumber(e.totalToday))}</span>
+            <span class="history-entry-total">مجموع فروش این روز: <strong>${toPersianDigits(formatNumber(e.totalToday))}</strong></span>
             <button type="button" class="btn btn-icon btn-sm btn-secondary" data-history-toggle="${lineKey}-${safeId}" title="مشاهده/اصلاح">
               <svg width="16" height="16"><use href="#icon-edit"></use></svg>
             </button>
@@ -2452,7 +2457,7 @@ async function generateFullReport(dateStr, invalidPct) {
   for (const lineKey of ["line1", "line2"]) {
     const rd = lastReportData[lineKey];
     const targets = state.monthlyTargets[lineKey] || {};
-    const cum = await getMonthCumulativeRows(lineKey, dateStr); // excludes today (not yet saved)
+    const cum = await getMonthCumulativeRows(lineKey, dateStr, { exclusive: true }); // strictly before today — so re-generating/overwriting an already-saved day replaces it instead of double-counting
     const rows = rd.rows.map((r) => {
       const cumulative = (cum.byGroup[r.groupId] || 0) + r.rounded;
       const target = targets[r.groupId] != null ? targets[r.groupId] : null;
