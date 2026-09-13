@@ -1267,6 +1267,14 @@ async function getLatestSalesLogDate(line) {
   return dates.reduce((a, b) => (a > b ? a : b));
 }
 
+// Remembers, per line, which date the currently-DISPLAYED baseline numbers
+// already account for (i.e. what computedThroughDate was used to fill the
+// form). Saving with an empty date field falls back to this instead of a
+// blank date — otherwise the live-computed (already history-inclusive)
+// numbers get saved back with an empty date, which then sums that same
+// history AGAIN on the next render, compounding higher on every save.
+const lastBaselineComputedThroughDate = { line1: "", line2: "" };
+
 async function renderBaselineTab() {
   for (const lineKey of ["line1", "line2"]) {
     const slot = $(`#baseline-${lineKey}-slot`);
@@ -1282,19 +1290,22 @@ async function renderBaselineTab() {
     let computedThroughDate = b.date || "";
     if (latestLogged && (!computedThroughDate || latestLogged > computedThroughDate)) computedThroughDate = latestLogged;
     if (!computedThroughDate) computedThroughDate = yesterdayJalaliStr();
+    lastBaselineComputedThroughDate[lineKey] = computedThroughDate;
     const computed = await getMonthCumulativeRows(lineKey, computedThroughDate);
     slot.innerHTML = `
       <div class="field-hint" style="margin-bottom:var(--space-3)">
         این عدد‌ها همیشه خودکار «تا ${escapeHtml(toPersianDigits(computedThroughDate))}» به‌روز است — هر بار «ذخیره فروش روز» را در گزارش‌گیری بزنید، همین‌جا هم خودش جلو می‌رود. هر عددی را هم می‌توانید همین‌جا دستی اصلاح و ذخیره کنید (مثلاً برای شروع ماه جدید یا شروع از وسط ماه).
       </div>
       <div class="field" style="margin-bottom:var(--space-4)">
-        <label>فروش تا تاریخ (خالی = ابتدای ماه / صفر)</label>
+        <label>فروش تا تاریخ (خالی = همین «${escapeHtml(toPersianDigits(computedThroughDate))}» بالا در نظر گرفته می‌شود)</label>
         <input type="text" class="baseline-date-input" data-line="${lineKey}" placeholder="مثلاً 1405/05/24" value="${escapeHtml(b.date || "")}" />
       </div>
       <div class="row" style="margin-bottom:var(--space-4); flex-wrap:wrap">
         <button type="button" class="btn btn-secondary btn-sm" data-baseline-upload="${lineKey}">${icon("upload")} محاسبه خودکار از فایل اکسل (فروش از اول ماه تا تاریخ بالا)</button>
         <input type="file" class="baseline-file-input" data-line="${lineKey}" accept=".xlsx,.xls,.csv" style="display:none" />
+        <span class="loading-row baseline-upload-loading" data-line="${lineKey}" style="display:none"><span class="spinner dark"></span> در حال محاسبه از فایل...</span>
       </div>
+      <div class="field-hint" style="margin-bottom:var(--space-4)">قبل از آپلود، تاریخ بالا را دقیقاً به روزی تنظیم کن که گزارش اکسل تا همان‌جا را پوشش می‌دهد — وگرنه تاریخ «${escapeHtml(toPersianDigits(computedThroughDate))}» به‌طور پیش‌فرض در نظر گرفته می‌شود.</div>
       <div class="order-list">
         ${groups
           .map(
@@ -1349,6 +1360,10 @@ async function renderBaselineTab() {
  * result so the user only has to review and save.
  */
 async function handleBaselineFileSelected(lineKey, file) {
+  const btn = $(`[data-baseline-upload="${lineKey}"]`);
+  const loadingEl = $(`.baseline-upload-loading[data-line="${lineKey}"]`);
+  if (btn) btn.disabled = true;
+  if (loadingEl) loadingEl.style.display = "inline-flex";
   try {
     const buf = await file.arrayBuffer();
     const workbook = readWorkbookFromArrayBuffer(buf);
@@ -1376,6 +1391,9 @@ async function handleBaselineFileSelected(lineKey, file) {
     showToast("مقادیر از فایل محاسبه شد — بررسی کنید و «ذخیره» بزنید", "success");
   } catch (err) {
     showToast("خطا در خواندن یا پردازش فایل", "error");
+  } finally {
+    if (btn) btn.disabled = false;
+    if (loadingEl) loadingEl.style.display = "none";
   }
 }
 
@@ -1383,11 +1401,15 @@ async function handleSaveBaselineLine(lineKey) {
   const slot = $(`#baseline-${lineKey}-slot`);
   if (!slot) return;
   const dateInput = $(".baseline-date-input", slot);
-  const date = normalizeStr(dateInput ? dateInput.value : "");
+  let date = normalizeStr(dateInput ? dateInput.value : "");
   if (date && !/^\d{4}\/\d{2}\/\d{2}$/.test(date)) {
     showToast("فرمت تاریخ باید مثل 1405/05/24 باشد", "error");
     return;
   }
+  // an empty date field means "save what's shown, as of the date it's
+  // already computed through" — NOT "start counting from day 1 again"
+  // (that would double-count this line's own logged history on every save).
+  if (!date) date = lastBaselineComputedThroughDate[lineKey] || yesterdayJalaliStr();
   const amounts = {};
   $all(".baseline-amount-input", slot).forEach((input) => {
     const gid = Number(input.dataset.group);
@@ -1403,9 +1425,13 @@ async function handleSaveBaselineLine(lineKey) {
 }
 
 async function handleClearBaselineLine(lineKey) {
-  state.monthBaseline[lineKey] = { date: "", amounts: {}, total: 0 };
+  // pin the reset to TODAY (not an empty date) so it actually reads as zero —
+  // an empty date sums this month's existing log history back on top, which
+  // defeats the point of a manual reset.
+  const todayStr = jalaliToStr(...todayJalali());
+  state.monthBaseline[lineKey] = { date: todayStr, amounts: {}, total: 0 };
   await setSetting("monthBaseline", state.monthBaseline);
-  showToast(`${lineKey === "line1" ? "لاین یک" : "لاین دو"} برای ماه جدید صفر شد`, "success");
+  showToast(`${lineKey === "line1" ? "لاین یک" : "لاین دو"} صفر شد (از امروز به بعد دوباره جمع می‌زند)`, "success");
   renderBaselineTab();
 }
 
