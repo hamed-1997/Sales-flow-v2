@@ -1410,6 +1410,24 @@ async function handleSaveBaselineLine(lineKey) {
   // already computed through" — NOT "start counting from day 1 again"
   // (that would double-count this line's own logged history on every save).
   if (!date) date = lastBaselineComputedThroughDate[lineKey] || yesterdayJalaliStr();
+
+  // Safety check: if that exact day was ALSO logged separately (via ذخیره
+  // فروش روز), saving "تا همین تاریخ" here means that day is treated as
+  // already baked into these numbers and won't be added again on top — if
+  // the numbers being saved don't actually include that day, its sale
+  // silently vanishes from every future total. Confirm first.
+  const existingSameDayEntry = await Store.get("salesLog", `${date}__${lineKey}`);
+  if (existingSameDayEntry) {
+    const ok = await confirmModal({
+      icon: "alert-triangle",
+      title: "این تاریخ قبلاً جداگانه ثبت شده",
+      body: `فروش روز ${toPersianDigits(date)} (${lineKey === "line1" ? "لاین یک" : "لاین دو"}) از قبل جداگانه در تاریخچه ذخیره شده (مجموع همان روز: ${toPersianDigits(formatNumber(existingSameDayEntry.totalToday))}). با ذخیره «فروش تا ${toPersianDigits(date)}» در همین‌جا، فرض بر این است که فروش همین روز از قبل داخل همین اعداد حساب شده — دیگر جداگانه رویش اضافه نمی‌شود. مطمئن شو مقادیری که الان وارد کردی واقعاً شامل فروش همان روز هم هست؛ اگر نیست، تاریخ را یک روز قبل‌تر بگذار تا آن روز جداگانه و درست جمع بزند.`,
+      confirmLabel: "می‌دانم، ذخیره کن",
+      confirmClass: "btn-primary",
+    });
+    if (!ok) return;
+  }
+
   const amounts = {};
   $all(".baseline-amount-input", slot).forEach((input) => {
     const gid = Number(input.dataset.group);
